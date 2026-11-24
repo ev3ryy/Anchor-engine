@@ -65,8 +65,7 @@ pub fn create(
         .stage_flags(vk::ShaderStageFlags::VERTEX)
         .offset(0)
         .size(std::mem::size_of::<[f32; 16]>() as u32)];
-    let layout_info =
-        vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants);
+    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants);
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();

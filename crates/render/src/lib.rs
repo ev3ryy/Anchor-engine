@@ -9,6 +9,8 @@ mod surface;
 mod swapchain;
 mod sync;
 
+pub use camera::Camera;
+
 pub use ash;
 
 use ash::vk;
@@ -186,14 +188,12 @@ impl Context {
         Ok(())
     }
 
-    pub fn draw(&mut self) -> Result<DrawStatus, Error> {
+    pub fn draw(&mut self, camera: &Camera) -> Result<DrawStatus, Error> {
         if self.swapchain.extent.width == 0 || self.swapchain.extent.height == 0 {
             return Ok(DrawStatus::Ok);
         }
-        let Some((depth_image, depth_view)) = self
-            .depth
-            .as_ref()
-            .map(|depth| (depth.image, depth.view))
+        let Some((depth_image, depth_view)) =
+            self.depth.as_ref().map(|depth| (depth.image, depth.view))
         else {
             return Ok(DrawStatus::Ok);
         };
@@ -225,7 +225,7 @@ impl Context {
         let extent = self.swapchain.extent;
         let pipeline = self.pipeline.pipeline;
         let layout = self.pipeline.layout();
-        let mvp = camera::mvp(extent).to_cols_array();
+        let mvp = camera.view_proj(extent).to_cols_array();
         let image_available = self.sync.image_available;
         let in_flight = self.sync.in_flight;
         let queue = self.device.graphics.handle;
@@ -393,10 +393,8 @@ fn record_frame(
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        let mvp_bytes = std::slice::from_raw_parts(
-            mvp.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(mvp),
-        );
+        let mvp_bytes =
+            std::slice::from_raw_parts(mvp.as_ptr().cast::<u8>(), std::mem::size_of_val(mvp));
         device.cmd_push_constants(
             command_buffer,
             layout,

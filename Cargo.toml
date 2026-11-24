@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/window", "crates/render", "crates/app"]
+resolver = "3"
+
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+app = { path = "crates/app" }

@@ -1,0 +1,35 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# MSVC / linker
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env / local secrets
+.env
+.env.*
+!.env.example
+
+# Logs / profiling
+*.log
+perf.data
+perf.data.old
+flamegraph.svg

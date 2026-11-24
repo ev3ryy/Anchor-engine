@@ -1,5 +1,7 @@
+mod commands;
 mod device;
 mod instance;
+mod queue;
 mod surface;
 mod swapchain;
 
@@ -67,7 +69,8 @@ pub(crate) fn supports_vulkan_1_3(version: u32) -> bool {
 }
 
 pub struct Context {
-    // Drop order: swapchain, device, surface, instance. The window must outlive this context.
+    // Drop order: commands, swapchain, device, surface, instance. The window must outlive this context.
+    commands: commands::CommandBundle,
     swapchain: swapchain::SwapchainBundle,
     device: device::DeviceBundle,
     surface: surface::SurfaceBundle,
@@ -83,6 +86,7 @@ impl Context {
         let instance = instance::create(window)?;
         let surface = surface::create(&instance.entry, &instance.instance, window)?;
         let device = device::create(&instance.instance, &surface.loader, surface.surface)?;
+        let commands = commands::create(&device.device, device.graphics.family)?;
         let swapchain = swapchain::create(
             &instance.instance,
             &device.device,
@@ -94,6 +98,7 @@ impl Context {
             vk::SwapchainKHR::null(),
         )?;
         Ok(Self {
+            commands,
             swapchain,
             device,
             surface,
@@ -126,10 +131,17 @@ impl Context {
     }
 
     pub fn graphics_queue_family(&self) -> u32 {
-        self.device.graphics_queue_family
+        self.device.graphics.family
     }
 
     pub fn graphics_queue(&self) -> vk::Queue {
-        self.device.graphics_queue
+        self.device.graphics.handle
+    }
+
+    pub fn submit(
+        &mut self,
+        record: impl FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.commands.submit(self.device.graphics.handle, record)
     }
 }

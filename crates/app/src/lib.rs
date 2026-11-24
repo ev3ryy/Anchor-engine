@@ -22,7 +22,8 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let render = match render::Context::new() {
+        let size = window.inner_size();
+        let render = match render::Context::new(&window, size.width, size.height) {
             Ok(render) => render,
             Err(err) => {
                 eprintln!("failed to initialize Vulkan: {err}");
@@ -36,8 +37,17 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let WindowEvent::CloseRequested = event {
-            event_loop.exit();
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(render) = self.render.as_mut()
+                    && let Err(err) = render.resize(size.width, size.height)
+                {
+                    eprintln!("failed to resize swapchain: {err}");
+                    event_loop.exit();
+                }
+            }
+            _ => {}
         }
     }
 }

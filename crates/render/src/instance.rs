@@ -1,6 +1,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use ash::{Entry, Instance, ext, vk};
+use raw_window_handle::HasDisplayHandle;
 
 use crate::{Error, supports_vulkan_1_3};
 
@@ -12,7 +13,7 @@ pub struct DebugState {
 }
 
 pub struct InstanceBundle {
-    _entry: Entry,
+    pub(crate) entry: Entry,
     pub instance: Instance,
     pub debug: Option<DebugState>,
 }
@@ -30,7 +31,7 @@ impl Drop for InstanceBundle {
     }
 }
 
-pub fn create() -> Result<InstanceBundle, Error> {
+pub fn create(display: &impl HasDisplayHandle) -> Result<InstanceBundle, Error> {
     let entry = unsafe { Entry::load() }.map_err(Error::Loading)?;
 
     let api_version =
@@ -49,7 +50,11 @@ pub fn create() -> Result<InstanceBundle, Error> {
 
     let enable_validation = cfg!(debug_assertions) && has_validation_layer(&entry)?;
 
-    let mut extension_names: Vec<*const c_char> = Vec::new();
+    let display_handle = display
+        .display_handle()
+        .map_err(Error::WindowHandle)?
+        .as_raw();
+    let mut extension_names = ash_window::enumerate_required_extensions(display_handle)?.to_vec();
     if enable_validation {
         extension_names.push(ext::debug_utils::NAME.as_ptr());
     }
@@ -86,7 +91,7 @@ pub fn create() -> Result<InstanceBundle, Error> {
     };
 
     Ok(InstanceBundle {
-        _entry: entry,
+        entry,
         instance,
         debug,
     })

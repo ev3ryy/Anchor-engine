@@ -1,19 +1,23 @@
 mod device;
 mod instance;
+mod surface;
+mod swapchain;
 
 pub use ash;
 
 use ash::vk;
-
-use instance::InstanceBundle;
+use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 
 #[derive(Debug)]
 pub enum Error {
     Loading(ash::LoadingError),
     Vulkan(vk::Result),
+    WindowHandle(HandleError),
     UnsupportedApiVersion(u32),
     NoPhysicalDevice,
     NoGraphicsQueue,
+    NoPresentQueue,
+    NoSurfaceFormat,
 }
 
 impl From<vk::Result> for Error {
@@ -27,6 +31,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Loading(err) => write!(f, "failed to load Vulkan: {err}"),
             Self::Vulkan(err) => write!(f, "Vulkan error: {err}"),
+            Self::WindowHandle(err) => write!(f, "invalid window handle: {err}"),
             Self::UnsupportedApiVersion(version) => {
                 let major = vk::api_version_major(*version);
                 let minor = vk::api_version_minor(*version);
@@ -34,6 +39,8 @@ impl std::fmt::Display for Error {
             }
             Self::NoPhysicalDevice => write!(f, "no suitable physical device found"),
             Self::NoGraphicsQueue => write!(f, "no graphics queue family found"),
+            Self::NoPresentQueue => write!(f, "no graphics queue supports presentation"),
+            Self::NoSurfaceFormat => write!(f, "no surface format found"),
         }
     }
 }
@@ -43,7 +50,12 @@ impl std::error::Error for Error {
         match self {
             Self::Loading(err) => Some(err),
             Self::Vulkan(err) => Some(err),
-            Self::UnsupportedApiVersion(_) | Self::NoPhysicalDevice | Self::NoGraphicsQueue => None,
+            Self::WindowHandle(err) => Some(err),
+            Self::UnsupportedApiVersion(_)
+            | Self::NoPhysicalDevice
+            | Self::NoGraphicsQueue
+            | Self::NoPresentQueue
+            | Self::NoSurfaceFormat => None,
         }
     }
 }
@@ -55,19 +67,58 @@ pub(crate) fn supports_vulkan_1_3(version: u32) -> bool {
 }
 
 pub struct Context {
-    // Declared first so the device is destroyed while the instance and its Entry are still alive.
+    // Drop order: swapchain, device, surface, instance. The window must outlive this context.
+    swapchain: swapchain::SwapchainBundle,
     device: device::DeviceBundle,
-    _instance: InstanceBundle,
+    surface: surface::SurfaceBundle,
+    instance: instance::InstanceBundle,
 }
 
 impl Context {
-    pub fn new() -> Result<Self, Error> {
-        let instance = instance::create()?;
-        let device = device::create(&instance.instance)?;
+    pub fn new(
+        window: &(impl HasDisplayHandle + HasWindowHandle),
+        width: u32,
+        height: u32,
+    ) -> Result<Self, Error> {
+        let instance = instance::create(window)?;
+        let surface = surface::create(&instance.entry, &instance.instance, window)?;
+        let device = device::create(&instance.instance, &surface.loader, surface.surface)?;
+        let swapchain = swapchain::create(
+            &instance.instance,
+            &device.device,
+            device.physical_device,
+            &surface.loader,
+            surface.surface,
+            width,
+            height,
+            vk::SwapchainKHR::null(),
+        )?;
         Ok(Self {
+            swapchain,
             device,
-            _instance: instance,
+            surface,
+            instance,
         })
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        unsafe { self.device.device.device_wait_idle() }?;
+        let replacement = swapchain::create(
+            &self.instance.instance,
+            &self.device.device,
+            self.device.physical_device,
+            &self.surface.loader,
+            self.surface.surface,
+            width,
+            height,
+            self.swapchain.swapchain,
+        )?;
+        let _old = std::mem::replace(&mut self.swapchain, replacement);
+        Ok(())
     }
 
     pub fn physical_device(&self) -> vk::PhysicalDevice {

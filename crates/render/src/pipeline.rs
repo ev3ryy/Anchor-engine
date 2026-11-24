@@ -9,11 +9,20 @@ pub struct PipelineBundle {
     layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     format: vk::Format,
+    depth_format: vk::Format,
 }
 
 impl PipelineBundle {
     pub fn format(&self) -> vk::Format {
         self.format
+    }
+
+    pub fn depth_format(&self) -> vk::Format {
+        self.depth_format
+    }
+
+    pub fn layout(&self) -> vk::PipelineLayout {
+        self.layout
     }
 }
 
@@ -26,7 +35,11 @@ impl Drop for PipelineBundle {
     }
 }
 
-pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Error> {
+pub fn create(
+    device: &Device,
+    format: vk::Format,
+    depth_format: vk::Format,
+) -> Result<PipelineBundle, Error> {
     let vert_code = read_spirv(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/triangle.vert.spv"
@@ -48,8 +61,13 @@ pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Err
             .push_next(&mut frag_module),
     ];
 
-    let layout =
-        unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)? };
+    let push_constants = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(std::mem::size_of::<[f32; 16]>() as u32)];
+    let layout_info =
+        vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants);
+    let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -60,7 +78,7 @@ pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Err
         .scissor_count(1);
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
+        .cull_mode(vk::CullModeFlags::BACK)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -71,13 +89,18 @@ pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Err
             | vk::ColorComponentFlags::B
             | vk::ColorComponentFlags::A,
     );
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
     let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
         .attachments(std::slice::from_ref(&color_attachment));
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(std::slice::from_ref(&format));
+        .color_attachment_formats(std::slice::from_ref(&format))
+        .depth_attachment_format(depth_format);
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -85,6 +108,7 @@ pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Err
         .viewport_state(&viewport_state)
         .rasterization_state(&rasterization)
         .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blend)
         .dynamic_state(&dynamic_state)
         .layout(layout)
@@ -112,6 +136,7 @@ pub fn create(device: &Device, format: vk::Format) -> Result<PipelineBundle, Err
         layout,
         pipeline,
         format,
+        depth_format,
     })
 }
 

@@ -1,4 +1,6 @@
+mod camera;
 mod commands;
+mod depth;
 mod device;
 mod instance;
 mod pipeline;
@@ -23,6 +25,8 @@ pub enum Error {
     NoPresentQueue,
     NoMaintenance5,
     NoSurfaceFormat,
+    NoDepthFormat,
+    NoMemoryType,
     Shader(std::io::Error),
 }
 
@@ -48,6 +52,8 @@ impl std::fmt::Display for Error {
             Self::NoPresentQueue => write!(f, "no graphics queue supports presentation"),
             Self::NoMaintenance5 => write!(f, "no device supports VK_KHR_maintenance5"),
             Self::NoSurfaceFormat => write!(f, "no surface format found"),
+            Self::NoDepthFormat => write!(f, "no supported depth format found"),
+            Self::NoMemoryType => write!(f, "no suitable device memory type found"),
             Self::Shader(err) => write!(f, "failed to read SPIR-V: {err}"),
         }
     }
@@ -65,7 +71,9 @@ impl std::error::Error for Error {
             | Self::NoGraphicsQueue
             | Self::NoPresentQueue
             | Self::NoMaintenance5
-            | Self::NoSurfaceFormat => None,
+            | Self::NoSurfaceFormat
+            | Self::NoDepthFormat
+            | Self::NoMemoryType => None,
         }
     }
 }
@@ -83,12 +91,13 @@ pub enum DrawStatus {
 }
 
 pub struct Context {
-    // Drop order: pipeline, sync, commands, swapchain, device, surface, instance.
+    // Drop order: pipeline, sync, commands, swapchain, depth, device, surface, instance.
     // The window must outlive this context.
     pipeline: pipeline::PipelineBundle,
     sync: sync::FrameSync,
     commands: commands::CommandBundle,
     swapchain: swapchain::SwapchainBundle,
+    depth: Option<depth::DepthBuffer>,
     device: device::DeviceBundle,
     surface: surface::SurfaceBundle,
     instance: instance::InstanceBundle,
@@ -123,12 +132,21 @@ impl Context {
             vk::SwapchainKHR::null(),
         )?;
         let sync = sync::create(&device.device)?;
-        let pipeline = pipeline::create(&device.device, swapchain.format)?;
+        let depth_format = depth::choose_format(&instance.instance, device.physical_device)?;
+        let depth = create_depth(
+            &instance.instance,
+            device.physical_device,
+            &device.device,
+            swapchain.extent,
+            depth_format,
+        )?;
+        let pipeline = pipeline::create(&device.device, swapchain.format, depth_format)?;
         Ok(Self {
             pipeline,
             sync,
             commands,
             swapchain,
+            depth,
             device,
             surface,
             instance,
@@ -151,10 +169,20 @@ impl Context {
             height,
             self.swapchain.swapchain,
         )?;
+        let depth_format = self.pipeline.depth_format();
+        let depth = create_depth(
+            &self.instance.instance,
+            self.device.physical_device,
+            &self.device.device,
+            replacement.extent,
+            depth_format,
+        )?;
         if self.pipeline.format() != replacement.format {
-            self.pipeline = pipeline::create(&self.device.device, replacement.format)?;
+            self.pipeline =
+                pipeline::create(&self.device.device, replacement.format, depth_format)?;
         }
         let _old = std::mem::replace(&mut self.swapchain, replacement);
+        self.depth = depth;
         Ok(())
     }
 
@@ -162,6 +190,13 @@ impl Context {
         if self.swapchain.extent.width == 0 || self.swapchain.extent.height == 0 {
             return Ok(DrawStatus::Ok);
         }
+        let Some((depth_image, depth_view)) = self
+            .depth
+            .as_ref()
+            .map(|depth| (depth.image, depth.view))
+        else {
+            return Ok(DrawStatus::Ok);
+        };
 
         unsafe {
             self.device
@@ -189,12 +224,25 @@ impl Context {
         let signal = self.swapchain.render_finished[index];
         let extent = self.swapchain.extent;
         let pipeline = self.pipeline.pipeline;
+        let layout = self.pipeline.layout();
+        let mvp = camera::mvp(extent).to_cols_array();
         let image_available = self.sync.image_available;
         let in_flight = self.sync.in_flight;
         let queue = self.device.graphics.handle;
 
         self.commands.record(|device, command_buffer| {
-            record_triangle(device, command_buffer, image, view, extent, pipeline)
+            record_frame(
+                device,
+                command_buffer,
+                image,
+                view,
+                depth_image,
+                depth_view,
+                extent,
+                pipeline,
+                layout,
+                &mvp,
+            )
         })?;
 
         unsafe { self.device.device.reset_fences(&[in_flight])? };
@@ -242,13 +290,30 @@ impl Context {
     }
 }
 
-fn record_triangle(
+fn create_depth(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: &ash::Device,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> Result<Option<depth::DepthBuffer>, Error> {
+    if extent.width == 0 || extent.height == 0 {
+        return Ok(None);
+    }
+    depth::create(instance, physical_device, device, extent, format).map(Some)
+}
+
+fn record_frame(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
     view: vk::ImageView,
+    depth_image: vk::Image,
+    depth_view: vk::ImageView,
     extent: vk::Extent2D,
     pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    mvp: &[f32; 16],
 ) -> Result<(), Error> {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -268,9 +333,33 @@ fn record_triangle(
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(range);
-    let to_color =
-        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_color));
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &to_color) };
+    let depth_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::DEPTH,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let to_depth = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(depth_image)
+        .subresource_range(depth_range);
+    let barriers = [to_color, to_depth];
+    let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 
     let attachment = vk::RenderingAttachmentInfo::default()
         .image_view(view)
@@ -282,16 +371,39 @@ fn record_triangle(
                 float32: [0.02, 0.02, 0.02, 1.0],
             },
         });
+    let depth_attachment = vk::RenderingAttachmentInfo::default()
+        .image_view(depth_view)
+        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        });
     let rendering = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent,
         })
         .layer_count(1)
-        .color_attachments(std::slice::from_ref(&attachment));
+        .color_attachments(std::slice::from_ref(&attachment))
+        .depth_attachment(&depth_attachment);
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        let mvp_bytes = std::slice::from_raw_parts(
+            mvp.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(mvp),
+        );
+        device.cmd_push_constants(
+            command_buffer,
+            layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            mvp_bytes,
+        );
         device.cmd_set_viewport(
             command_buffer,
             0,
@@ -312,7 +424,7 @@ fn record_triangle(
                 extent,
             }],
         );
-        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        device.cmd_draw(command_buffer, 36, 1, 0, 0);
         device.cmd_end_rendering(command_buffer);
     }
 

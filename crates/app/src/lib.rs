@@ -32,6 +32,7 @@ impl ApplicationHandler for App {
             }
         };
 
+        window.request_redraw();
         self.render = Some(render);
         self.window = Some(window);
     }
@@ -40,11 +41,44 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(render) = self.render.as_mut()
-                    && let Err(err) = render.resize(size.width, size.height)
-                {
+                let Some(render) = self.render.as_mut() else {
+                    return;
+                };
+                if let Err(err) = render.resize(size.width, size.height) {
                     eprintln!("failed to resize swapchain: {err}");
                     event_loop.exit();
+                    return;
+                }
+                if size.width > 0 && size.height > 0 {
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let Some(render) = self.render.as_mut() else {
+                    return;
+                };
+                let Some(window) = self.window.as_ref() else {
+                    return;
+                };
+                match render.draw() {
+                    Ok(render::DrawStatus::Ok) => {}
+                    Ok(render::DrawStatus::OutOfDate) => {
+                        let size = window.inner_size();
+                        if let Err(err) = render.resize(size.width, size.height) {
+                            eprintln!("failed to resize swapchain: {err}");
+                            event_loop.exit();
+                            return;
+                        }
+                        if size.width > 0 && size.height > 0 {
+                            window.request_redraw();
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("failed to draw: {err}");
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}

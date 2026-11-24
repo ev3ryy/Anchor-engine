@@ -3,20 +3,26 @@ use ash::{Device, Instance, khr::swapchain, vk};
 use crate::Error;
 
 pub struct SwapchainBundle {
+    device: Device,
     pub loader: swapchain::Device,
     pub swapchain: vk::SwapchainKHR,
-    #[allow(dead_code)]
     pub images: Vec<vk::Image>,
-    #[allow(dead_code)]
+    pub views: Vec<vk::ImageView>,
+    pub render_finished: Vec<vk::Semaphore>,
     pub format: vk::Format,
-    #[allow(dead_code)]
     pub extent: vk::Extent2D,
 }
 
 impl Drop for SwapchainBundle {
     fn drop(&mut self) {
-        if self.swapchain != vk::SwapchainKHR::null() {
-            unsafe {
+        unsafe {
+            for &semaphore in &self.render_finished {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for &view in &self.views {
+                self.device.destroy_image_view(view, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
                 self.loader.destroy_swapchain(self.swapchain, None);
             }
         }
@@ -69,15 +75,79 @@ pub fn create(
 
     let loader = swapchain::Device::new(instance, device);
     let swapchain = unsafe { loader.create_swapchain(&create_info, None)? };
-    let images = unsafe { loader.get_swapchain_images(swapchain)? };
+    let images = match unsafe { loader.get_swapchain_images(swapchain) } {
+        Ok(images) => images,
+        Err(err) => {
+            unsafe { loader.destroy_swapchain(swapchain, None) };
+            return Err(err.into());
+        }
+    };
+
+    let mut views = Vec::with_capacity(images.len());
+    let mut render_finished = Vec::with_capacity(images.len());
+    for &image in &images {
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(color_range());
+        match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(view) => views.push(view),
+            Err(err) => {
+                destroy_partial(device, &loader, swapchain, &views, &render_finished);
+                return Err(err.into());
+            }
+        }
+
+        match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+            Ok(semaphore) => render_finished.push(semaphore),
+            Err(err) => {
+                destroy_partial(device, &loader, swapchain, &views, &render_finished);
+                return Err(err.into());
+            }
+        }
+    }
 
     Ok(SwapchainBundle {
+        device: device.clone(),
         loader,
         swapchain,
         images,
+        views,
+        render_finished,
         format,
         extent,
     })
+}
+
+fn destroy_partial(
+    device: &Device,
+    loader: &swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    views: &[vk::ImageView],
+    render_finished: &[vk::Semaphore],
+) {
+    unsafe {
+        for &semaphore in render_finished {
+            device.destroy_semaphore(semaphore, None);
+        }
+        for &view in views {
+            device.destroy_image_view(view, None);
+        }
+        if swapchain != vk::SwapchainKHR::null() {
+            loader.destroy_swapchain(swapchain, None);
+        }
+    }
+}
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
 }
 
 fn choose_format(formats: &[vk::SurfaceFormatKHR]) -> Option<(vk::Format, vk::ColorSpaceKHR)> {

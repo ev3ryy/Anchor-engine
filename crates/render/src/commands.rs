@@ -11,7 +11,6 @@ pub struct CommandBundle {
 impl Drop for CommandBundle {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.device_wait_idle();
             self.device.destroy_command_pool(self.pool, None);
         }
     }
@@ -75,6 +74,52 @@ impl CommandBundle {
                 vk::Fence::null(),
             )?;
             self.device.queue_wait_idle(queue)?;
+        }
+        Ok(())
+    }
+
+    pub fn record(
+        &self,
+        record: impl FnOnce(&Device, vk::CommandBuffer) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(self.buffer, &begin_info)? };
+
+        if let Err(err) = record(&self.device, self.buffer) {
+            unsafe {
+                let _ = self
+                    .device
+                    .reset_command_buffer(self.buffer, vk::CommandBufferResetFlags::empty());
+            }
+            return Err(err);
+        }
+
+        unsafe { self.device.end_command_buffer(self.buffer)? };
+        Ok(())
+    }
+
+    pub fn submit_frame(
+        &self,
+        queue: vk::Queue,
+        wait: vk::Semaphore,
+        signal: vk::Semaphore,
+        fence: vk::Fence,
+    ) -> Result<(), Error> {
+        let wait_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(wait)
+            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+        let signal_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(signal)
+            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+        let command_info = vk::CommandBufferSubmitInfo::default().command_buffer(self.buffer);
+        let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(std::slice::from_ref(&wait_info))
+            .command_buffer_infos(std::slice::from_ref(&command_info))
+            .signal_semaphore_infos(std::slice::from_ref(&signal_info));
+        unsafe {
+            self.device
+                .queue_submit2(queue, std::slice::from_ref(&submit), fence)?;
         }
         Ok(())
     }

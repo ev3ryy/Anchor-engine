@@ -1,104 +1,119 @@
-use std::io::Cursor;
+use std::ffi::CStr;
 
 use ash::{Device, vk};
 
 use crate::Error;
+use crate::shader::state::{BlendMode, GraphicsState};
 
-pub struct PipelineBundle {
-    device: Device,
-    layout: vk::PipelineLayout,
-    pub pipeline: vk::Pipeline,
-    format: vk::Format,
-    depth_format: vk::Format,
+pub struct Modules {
+    pub vertex: vk::ShaderModule,
+    pub fragment: vk::ShaderModule,
 }
 
-impl PipelineBundle {
-    pub fn format(&self) -> vk::Format {
-        self.format
-    }
-
-    pub fn depth_format(&self) -> vk::Format {
-        self.depth_format
-    }
-
-    pub fn layout(&self) -> vk::PipelineLayout {
-        self.layout
-    }
-}
-
-impl Drop for PipelineBundle {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_pipeline_layout(self.layout, None);
+pub fn create_modules(device: &Device, vertex: &[u32], fragment: &[u32]) -> Result<Modules, Error> {
+    let vertex_info = vk::ShaderModuleCreateInfo::default().code(vertex);
+    let vertex = unsafe { device.create_shader_module(&vertex_info, None)? };
+    let fragment_info = vk::ShaderModuleCreateInfo::default().code(fragment);
+    let fragment = match unsafe { device.create_shader_module(&fragment_info, None) } {
+        Ok(fragment) => fragment,
+        Err(err) => {
+            unsafe { device.destroy_shader_module(vertex, None) };
+            return Err(err.into());
         }
-    }
+    };
+    Ok(Modules { vertex, fragment })
 }
 
-pub fn create(
-    device: &Device,
-    format: vk::Format,
-    depth_format: vk::Format,
-) -> Result<PipelineBundle, Error> {
-    let vert_code = read_spirv(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/triangle.vert.spv"
-    )))?;
-    let frag_code = read_spirv(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/triangle.frag.spv"
-    )))?;
-    let mut vert_module = vk::ShaderModuleCreateInfo::default().code(&vert_code);
-    let mut frag_module = vk::ShaderModuleCreateInfo::default().code(&frag_code);
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .name(c"vertexMain")
-            .push_next(&mut vert_module),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .name(c"fragmentMain")
-            .push_next(&mut frag_module),
-    ];
+pub fn destroy_module(device: &Device, module: vk::ShaderModule) {
+    unsafe { device.destroy_shader_module(module, None) };
+}
 
-    let push_constants = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
-        .offset(0)
-        .size(std::mem::size_of::<[f32; 16]>() as u32)];
-    let layout_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants);
-    let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+pub fn create_graphics(
+    device: &Device,
+    cache: vk::PipelineCache,
+    modules: &Modules,
+    vertex_entry: &CStr,
+    fragment_entry: &CStr,
+    layout: vk::PipelineLayout,
+    state: &GraphicsState,
+    color_format: vk::Format,
+    depth_format: vk::Format,
+    spec: &[(u32, u32)],
+) -> Result<vk::Pipeline, Error> {
+    let spec_entries: Vec<vk::SpecializationMapEntry> = spec
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| {
+            vk::SpecializationMapEntry::default()
+                .constant_id(*id)
+                .offset((index * 4) as u32)
+                .size(4)
+        })
+        .collect();
+    let spec_data: Vec<u8> = spec
+        .iter()
+        .flat_map(|(_, value)| value.to_le_bytes())
+        .collect();
+    let spec_info = vk::SpecializationInfo::default()
+        .map_entries(&spec_entries)
+        .data(&spec_data);
+    let spec_info = (!spec.is_empty()).then_some(spec_info);
+
+    let mut vertex_stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(modules.vertex)
+        .name(vertex_entry);
+    let mut fragment_stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(modules.fragment)
+        .name(fragment_entry);
+    if let Some(spec_info) = spec_info.as_ref() {
+        vertex_stage = vertex_stage.specialization_info(spec_info);
+        fragment_stage = fragment_stage.specialization_info(spec_info);
+    }
+    let stages = [vertex_stage, fragment_stage];
 
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .topology(state.topology)
         .primitive_restart_enable(false);
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
     let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .cull_mode(state.cull)
+        .front_face(state.front_face)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let color_attachment = vk::PipelineColorBlendAttachmentState::default().color_write_mask(
+    let mut color_attachment = vk::PipelineColorBlendAttachmentState::default().color_write_mask(
         vk::ColorComponentFlags::R
             | vk::ColorComponentFlags::G
             | vk::ColorComponentFlags::B
             | vk::ColorComponentFlags::A,
     );
+    if state.blend == BlendMode::Alpha {
+        color_attachment = color_attachment
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD);
+    }
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS);
+        .depth_test_enable(state.depth_test)
+        .depth_write_enable(state.depth_write)
+        .depth_compare_op(state.depth_compare);
     let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
         .attachments(std::slice::from_ref(&color_attachment));
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(std::slice::from_ref(&format))
+        .color_attachment_formats(std::slice::from_ref(&color_format))
         .depth_attachment_format(depth_format);
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
@@ -113,10 +128,8 @@ pub fn create(
         .layout(layout)
         .push_next(&mut rendering);
 
-    let pipeline = match unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-    } {
-        Ok(mut pipelines) => pipelines.remove(0),
+    match unsafe { device.create_graphics_pipelines(cache, &[pipeline_info], None) } {
+        Ok(mut pipelines) => Ok(pipelines.remove(0)),
         Err((pipelines, err)) => {
             unsafe {
                 for pipeline in pipelines {
@@ -124,21 +137,8 @@ pub fn create(
                         device.destroy_pipeline(pipeline, None);
                     }
                 }
-                device.destroy_pipeline_layout(layout, None);
             }
-            return Err(err.into());
+            Err(err.into())
         }
-    };
-
-    Ok(PipelineBundle {
-        device: device.clone(),
-        layout,
-        pipeline,
-        format,
-        depth_format,
-    })
-}
-
-fn read_spirv(bytes: &[u8]) -> Result<Vec<u32>, Error> {
-    ash::util::read_spv(&mut Cursor::new(bytes)).map_err(Error::Shader)
+    }
 }

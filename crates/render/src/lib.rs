@@ -5,6 +5,7 @@ mod device;
 mod instance;
 mod pipeline;
 mod queue;
+mod shader;
 mod surface;
 mod swapchain;
 mod sync;
@@ -30,6 +31,9 @@ pub enum Error {
     NoDepthFormat,
     NoMemoryType,
     Shader(std::io::Error),
+    ShaderCompile { file: String, message: String },
+    ShaderInterface(String),
+    UnknownShader(String),
 }
 
 impl From<vk::Result> for Error {
@@ -57,6 +61,11 @@ impl std::fmt::Display for Error {
             Self::NoDepthFormat => write!(f, "no supported depth format found"),
             Self::NoMemoryType => write!(f, "no suitable device memory type found"),
             Self::Shader(err) => write!(f, "failed to read SPIR-V: {err}"),
+            Self::ShaderCompile { file, message } => {
+                write!(f, "failed to compile {file}: {message}")
+            }
+            Self::ShaderInterface(message) => write!(f, "{message}"),
+            Self::UnknownShader(name) => write!(f, "unknown shader {name}"),
         }
     }
 }
@@ -75,7 +84,10 @@ impl std::error::Error for Error {
             | Self::NoMaintenance5
             | Self::NoSurfaceFormat
             | Self::NoDepthFormat
-            | Self::NoMemoryType => None,
+            | Self::NoMemoryType
+            | Self::ShaderCompile { .. }
+            | Self::ShaderInterface(_)
+            | Self::UnknownShader(_) => None,
         }
     }
 }
@@ -93,9 +105,9 @@ pub enum DrawStatus {
 }
 
 pub struct Context {
-    // Drop order: pipeline, sync, commands, swapchain, depth, device, surface, instance.
-    // The window must outlive this context.
-    pipeline: pipeline::PipelineBundle,
+    // Drop order: shaders, sync, commands, swapchain, depth, device, surface, instance.
+    // The window must outlive this context. ShaderSet drops while the device is still alive.
+    shaders: shader::ShaderSet,
     sync: sync::FrameSync,
     commands: commands::CommandBundle,
     swapchain: swapchain::SwapchainBundle,
@@ -142,9 +154,15 @@ impl Context {
             swapchain.extent,
             depth_format,
         )?;
-        let pipeline = pipeline::create(&device.device, swapchain.format, depth_format)?;
+        let shaders = shader::ShaderSet::new(
+            &instance.instance,
+            device.physical_device,
+            &device.device,
+            swapchain.format,
+            depth_format,
+        )?;
         Ok(Self {
-            pipeline,
+            shaders,
             sync,
             commands,
             swapchain,
@@ -161,6 +179,7 @@ impl Context {
         }
 
         unsafe { self.device.device.device_wait_idle() }?;
+        self.shaders.flush_retired();
         let replacement = swapchain::create(
             &self.instance.instance,
             &self.device.device,
@@ -171,7 +190,7 @@ impl Context {
             height,
             self.swapchain.swapchain,
         )?;
-        let depth_format = self.pipeline.depth_format();
+        let depth_format = self.shaders.depth_format();
         let depth = create_depth(
             &self.instance.instance,
             self.device.physical_device,
@@ -179,9 +198,9 @@ impl Context {
             replacement.extent,
             depth_format,
         )?;
-        if self.pipeline.format() != replacement.format {
-            self.pipeline =
-                pipeline::create(&self.device.device, replacement.format, depth_format)?;
+        if self.shaders.color_format() != replacement.format {
+            self.shaders.recreate(replacement.format, depth_format)?;
+            self.shaders.flush_retired();
         }
         let _old = std::mem::replace(&mut self.swapchain, replacement);
         self.depth = depth;
@@ -203,6 +222,8 @@ impl Context {
                 .device
                 .wait_for_fences(&[self.sync.in_flight], true, u64::MAX)?;
         }
+        self.shaders.flush_retired();
+        self.shaders.poll();
 
         let acquire = unsafe {
             self.swapchain.loader.acquire_next_image(
@@ -223,8 +244,7 @@ impl Context {
         let view = self.swapchain.views[index];
         let signal = self.swapchain.render_finished[index];
         let extent = self.swapchain.extent;
-        let pipeline = self.pipeline.pipeline;
-        let layout = self.pipeline.layout();
+        let drawn = self.shaders.pipeline("triangle", &[])?;
         let mvp = camera.view_proj(extent).to_cols_array();
         let image_available = self.sync.image_available;
         let in_flight = self.sync.in_flight;
@@ -239,8 +259,11 @@ impl Context {
                 depth_image,
                 depth_view,
                 extent,
-                pipeline,
-                layout,
+                drawn.pipeline,
+                drawn.layout,
+                drawn.push_stages,
+                drawn.push_offset,
+                drawn.push_size,
                 &mvp,
             )
         })?;
@@ -313,6 +336,9 @@ fn record_frame(
     extent: vk::Extent2D,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
+    push_stages: vk::ShaderStageFlags,
+    push_offset: u32,
+    push_size: u32,
     mvp: &[f32; 16],
 ) -> Result<(), Error> {
     let range = vk::ImageSubresourceRange {
@@ -390,18 +416,18 @@ fn record_frame(
         .layer_count(1)
         .color_attachments(std::slice::from_ref(&attachment))
         .depth_attachment(&depth_attachment);
+    if push_size as usize > std::mem::size_of_val(mvp) {
+        return Err(Error::ShaderInterface(format!(
+            "camera push is {} bytes, shader contract is {push_size}",
+            std::mem::size_of_val(mvp)
+        )));
+    }
+    let mvp_bytes =
+        unsafe { std::slice::from_raw_parts(mvp.as_ptr().cast::<u8>(), push_size as usize) };
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        let mvp_bytes =
-            std::slice::from_raw_parts(mvp.as_ptr().cast::<u8>(), std::mem::size_of_val(mvp));
-        device.cmd_push_constants(
-            command_buffer,
-            layout,
-            vk::ShaderStageFlags::VERTEX,
-            0,
-            mvp_bytes,
-        );
+        device.cmd_push_constants(command_buffer, layout, push_stages, push_offset, mvp_bytes);
         device.cmd_set_viewport(
             command_buffer,
             0,

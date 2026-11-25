@@ -7,4 +7,6 @@ edition = "2024"
 ash = "0.38.0"
 ash-window = "0.13"
 glam = "0.30"
-raw-window-handle = "0.6"
+notify = "8"
+raw-window-handle = { version = "0.6", features = ["std"] }
+spirq = "1.3"

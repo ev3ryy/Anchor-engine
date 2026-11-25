@@ -1,54 +1,93 @@
 use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
+#[path = "src/shader/compile.rs"]
+mod compile;
+#[path = "src/shader/scan.rs"]
+mod scan;
 
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let src = PathBuf::from("shaders").join("triangle.slang");
-    println!("cargo:rerun-if-changed={}", src.display());
-    compile(
-        &src,
-        "vertexMain",
-        "vertex",
-        &out_dir.join("triangle.vert.spv"),
+    let profile = env::var("PROFILE").unwrap_or_default();
+    if profile != "release" {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=shaders");
+    println!("cargo:rerun-if-changed=src/shader/scan.rs");
+    println!("cargo:rerun-if-changed=src/shader/compile.rs");
+
+    let out_dir = Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).to_path_buf();
+    let shaders = Path::new("shaders");
+    let listed = scan::list_graphics(shaders)
+        .unwrap_or_else(|message| panic!("failed to list shaders: {message}"));
+
+    let mut manifest = String::from(
+        "pub struct EmbeddedProgram {\n    \
+         pub name: &'static str,\n    \
+         pub vertex_entry: &'static str,\n    \
+         pub fragment_entry: &'static str,\n    \
+         pub vertex: &'static [u8],\n    \
+         pub fragment: &'static [u8],\n\
+         }\n\n\
+         pub static PROGRAMS: &[EmbeddedProgram] = &[\n",
     );
-    compile(
-        &src,
-        "fragmentMain",
-        "fragment",
-        &out_dir.join("triangle.frag.spv"),
-    );
+
+    for item in listed {
+        let scan::Listed::Program(source) = item else {
+            let scan::Listed::Failed { name, message } = item else {
+                unreachable!();
+            };
+            panic!("shader {name}: {message}");
+        };
+        let vertex_spv = format!("{}.vert.spv", source.name);
+        let fragment_spv = format!("{}.frag.spv", source.name);
+        compile::compile_stage(
+            &source.path,
+            &source.vertex,
+            "vertex",
+            shaders,
+            compile::Optimize::Release,
+            &out_dir.join(&vertex_spv),
+        )
+        .unwrap_or_else(|message| panic!("shader {}: {message}", source.name));
+        compile::compile_stage(
+            &source.path,
+            &source.fragment,
+            "fragment",
+            shaders,
+            compile::Optimize::Release,
+            &out_dir.join(&fragment_spv),
+        )
+        .unwrap_or_else(|message| panic!("shader {}: {message}", source.name));
+        manifest.push_str(&format!(
+            "    EmbeddedProgram {{ name: {name}, vertex_entry: {vertex}, fragment_entry: {fragment}, vertex: include_bytes!({vertex_spv}), fragment: include_bytes!({fragment_spv}) }},\n",
+            name = rust_string(&source.name),
+            vertex = rust_string(&source.vertex),
+            fragment = rust_string(&source.fragment),
+            vertex_spv = rust_string(&vertex_spv),
+            fragment_spv = rust_string(&fragment_spv),
+        ));
+    }
+    manifest.push_str("];\n");
+
+    let mut file =
+        fs::File::create(out_dir.join("shaders_gen.rs")).expect("create shader manifest");
+    file.write_all(manifest.as_bytes())
+        .expect("write shader manifest");
 }
 
-fn compile(src: &Path, entry: &str, stage: &str, dst: &Path) {
-    let output = Command::new(slangc())
-        .arg(src)
-        .args(["-entry", entry, "-stage", stage])
-        .args(["-target", "spirv", "-profile", "spirv_1_6"])
-        .arg("-fvk-use-entrypoint-name")
-        .arg("-o")
-        .arg(dst)
-        .output()
-        .unwrap_or_else(|err| panic!("slangc not found ({err}); install the Vulkan SDK or Slang"));
-    if !output.status.success() {
-        panic!(
-            "slangc failed on {} ({entry}): {}",
-            src.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-fn slangc() -> PathBuf {
-    if let Ok(sdk) = env::var("VULKAN_SDK") {
-        let windows = PathBuf::from(&sdk).join("Bin").join("slangc.exe");
-        if windows.exists() {
-            return windows;
-        }
-        let unix = PathBuf::from(&sdk).join("bin").join("slangc");
-        if unix.exists() {
-            return unix;
+fn rust_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            ch => out.push(ch),
         }
     }
-    PathBuf::from("slangc")
+    out.push('"');
+    out
 }

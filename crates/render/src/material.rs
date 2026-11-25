@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::texture::{SamplerId, TextureId};
 
 pub const MATERIAL_CAPACITY: u32 = 256;
 pub const PARAM_STRIDE: usize = 256;
@@ -30,24 +31,9 @@ pub struct FramePush {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextureId {
-    pub index: u32,
-    pub generation: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaterialId {
     pub index: u32,
     pub generation: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SamplerId {
-    LinearRepeat = 0,
-    LinearClamp = 1,
-    NearestRepeat = 2,
-    NearestClamp = 3,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,9 +205,8 @@ fn next_generation(generation: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HEADER_STRIDE, MaterialRef, MaterialStore, PARAM_STRIDE, SamplerId, TYPE_UNLIT, write_color,
-    };
+    use super::{HEADER_STRIDE, MaterialRef, MaterialStore, PARAM_STRIDE, TYPE_UNLIT, write_color};
+    use crate::texture::SamplerId;
 
     #[test]
     fn unlit_color_is_sixteen_bytes_at_the_slot_origin() {

@@ -1,46 +1,23 @@
 use ash::{Device, Instance, vk};
 
 use crate::Error;
-use crate::gpu::{GpuBuffer, GpuImage};
+use crate::gpu::GpuBuffer;
 use crate::material::{
     HEADER_STRIDE, MATERIAL_CAPACITY, MaterialDesc, MaterialId, MaterialStore, PARAM_STRIDE,
-    SamplerId, TextureId,
 };
 use crate::shader::layout::{FRAME_PUSH_BYTES, frame_push_stages};
-
-struct TextureSlot {
-    generation: u32,
-    image: Option<GpuImage>,
-}
-
-struct RetiredTexture {
-    index: u32,
-    image: GpuImage,
-}
-
-struct PendingTexture {
-    index: u32,
-    generation: u32,
-    extent: vk::Extent2D,
-    image: GpuImage,
-}
+use crate::texture::{SamplerId, TextureId, TextureStore};
 
 pub struct Bindless {
     device: Device,
-    instance: Instance,
-    physical_device: vk::PhysicalDevice,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     samplers: Vec<vk::Sampler>,
-    staging: Option<GpuBuffer>,
     headers: GpuBuffer,
     params: GpuBuffer,
-    textures: Vec<TextureSlot>,
-    free_textures: Vec<u32>,
-    retired: Vec<RetiredTexture>,
-    pending: Option<PendingTexture>,
+    textures: TextureStore,
     materials: MaterialStore,
 }
 
@@ -137,25 +114,14 @@ impl Bindless {
 
         let mut heap = Self {
             device: device.clone(),
-            instance: instance.clone(),
-            physical_device,
             set_layout,
             pipeline_layout,
             pool,
             set,
             samplers: Vec::new(),
-            staging: None,
             headers,
             params,
-            textures: (0..texture_capacity)
-                .map(|_| TextureSlot {
-                    generation: 0,
-                    image: None,
-                })
-                .collect(),
-            free_textures: (1..texture_capacity).rev().collect(),
-            retired: Vec::new(),
-            pending: None,
+            textures: TextureStore::new(instance, physical_device, device, texture_capacity),
             materials: MaterialStore::new(MATERIAL_CAPACITY),
         };
         let header = heap.headers.buffer;
@@ -167,7 +133,7 @@ impl Bindless {
     }
 
     pub fn prepare_white(&mut self) -> Result<(), Error> {
-        self.prepare_image(0, 1, 1, &[255, 255, 255, 255])
+        self.textures.prepare_white()
     }
 
     pub fn pipeline_layout(&self) -> vk::PipelineLayout {
@@ -183,63 +149,26 @@ impl Bindless {
     }
 
     pub fn prepare_texture(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<(), Error> {
-        let index = self.free_textures.pop().ok_or(Error::OutOfTextures)?;
-        if let Err(err) = self.prepare_image(index, width, height, pixels) {
-            self.free_textures.push(index);
-            return Err(err);
-        }
-        Ok(())
+        self.textures.prepare(width, height, pixels)
     }
 
     pub fn upload_source(&self) -> (vk::Buffer, vk::Image, vk::Extent2D) {
-        let pending = self.pending.as_ref().expect("texture upload");
-        let staging = self.staging.as_ref().expect("staging buffer");
-        (staging.buffer, pending.image.image(), pending.extent)
+        self.textures.upload_source()
     }
 
     pub fn cancel_upload(&mut self) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        if pending.index != 0 {
-            self.free_textures.push(pending.index);
-        }
+        self.textures.cancel_upload()
     }
 
     pub fn finish_upload(&mut self) -> Result<TextureId, Error> {
-        let pending = self.pending.take().expect("texture upload");
-        if let Err(err) = self.write_sampled(pending.index, pending.image.view) {
-            if pending.index != 0 {
-                self.free_textures.push(pending.index);
-            }
-            return Err(err);
-        }
-        let generation = pending.generation;
-        let index = pending.index;
-        let slot = &mut self.textures[index as usize];
-        slot.generation = generation;
-        slot.image = Some(pending.image);
-        Ok(TextureId { index, generation })
+        let device = &self.device;
+        let set = self.set;
+        self.textures
+            .finish_upload(|index, view| write_sampled(device, set, index, view))
     }
 
     pub fn free_texture(&mut self, id: TextureId) -> Result<(), Error> {
-        if id.index == 0 {
-            return Err(Error::StaleTexture);
-        }
-        let slot = self
-            .textures
-            .get_mut(id.index as usize)
-            .ok_or(Error::StaleTexture)?;
-        if slot.generation != id.generation || slot.image.is_none() {
-            return Err(Error::StaleTexture);
-        }
-        let image = slot.image.take().expect("live texture");
-        slot.generation = next_generation(slot.generation);
-        self.retired.push(RetiredTexture {
-            index: id.index,
-            image,
-        });
-        Ok(())
+        self.textures.free(id)
     }
 
     pub fn create_material(&mut self, desc: MaterialDesc) -> Result<MaterialId, Error> {
@@ -263,16 +192,13 @@ impl Bindless {
     pub fn flush(&mut self) {
         self.materials
             .flush(self.headers.mapped(), self.params.mapped());
-        let white_view = self.textures[0].image.as_ref().expect("white texture").view;
-        let retired = std::mem::take(&mut self.retired);
-        for retired in retired {
-            if self.write_sampled(retired.index, white_view).is_err() {
-                self.retired.push(retired);
+        let white_view = self.textures.white_view();
+        for (index, image) in self.textures.flush_retired() {
+            if write_sampled(&self.device, self.set, index, white_view).is_err() {
+                self.textures.defer_retired(index, image);
                 continue;
             }
-            let index = retired.index;
-            drop(retired.image);
-            self.free_textures.push(index);
+            self.textures.reclaim(index, image);
         }
     }
 
@@ -282,74 +208,8 @@ impl Bindless {
                 color,
                 albedo,
                 sampler,
-            } => Ok((self.texture_index(albedo)?, sampler, color)),
+            } => Ok((self.textures.index(albedo)?, sampler, color)),
         }
-    }
-
-    fn texture_index(&self, id: TextureId) -> Result<u32, Error> {
-        let slot = self
-            .textures
-            .get(id.index as usize)
-            .ok_or(Error::StaleTexture)?;
-        if slot.generation != id.generation || slot.image.is_none() {
-            return Err(Error::StaleTexture);
-        }
-        Ok(id.index)
-    }
-
-    fn prepare_image(
-        &mut self,
-        index: u32,
-        width: u32,
-        height: u32,
-        pixels: &[u8],
-    ) -> Result<(), Error> {
-        let byte_count = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|texels| texels.checked_mul(4))
-            .ok_or(Error::InvalidImage)?;
-        if width == 0 || height == 0 || pixels.len() != byte_count {
-            return Err(Error::InvalidImage);
-        }
-        self.ensure_staging(byte_count)?;
-        let staging = self.staging.as_ref().expect("staging buffer");
-        unsafe {
-            std::ptr::copy_nonoverlapping(pixels.as_ptr(), staging.mapped(), pixels.len());
-        }
-        let generation = next_generation(self.textures[index as usize].generation);
-        let image = GpuImage::sampled(
-            &self.instance,
-            self.physical_device,
-            &self.device,
-            vk::Extent2D { width, height },
-            vk::Format::R8G8B8A8_SRGB,
-        )?;
-        self.pending = Some(PendingTexture {
-            index,
-            generation,
-            extent: vk::Extent2D { width, height },
-            image,
-        });
-        Ok(())
-    }
-
-    fn ensure_staging(&mut self, bytes: usize) -> Result<(), Error> {
-        let size = bytes as vk::DeviceSize;
-        if self
-            .staging
-            .as_ref()
-            .is_some_and(|buffer| buffer.size() >= size)
-        {
-            return Ok(());
-        }
-        self.staging = Some(GpuBuffer::host_visible(
-            &self.instance,
-            self.physical_device,
-            &self.device,
-            size.max(4),
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?);
-        Ok(())
     }
 
     fn create_samplers(&mut self) -> Result<(), Error> {
@@ -378,20 +238,6 @@ impl Bindless {
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
     }
 
-    fn write_sampled(&self, index: u32, view: vk::ImageView) -> Result<(), Error> {
-        let info = vk::DescriptorImageInfo::default()
-            .image_view(view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.set)
-            .dst_binding(0)
-            .dst_array_element(index)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .image_info(std::slice::from_ref(&info));
-        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
-        Ok(())
-    }
-
     fn write_buffer(&self, binding: u32, buffer: vk::Buffer) -> Result<(), Error> {
         let info = vk::DescriptorBufferInfo::default()
             .buffer(buffer)
@@ -407,9 +253,23 @@ impl Bindless {
     }
 }
 
-fn next_generation(generation: u32) -> u32 {
-    let next = generation.wrapping_add(1);
-    if next == 0 { 1 } else { next }
+fn write_sampled(
+    device: &Device,
+    set: vk::DescriptorSet,
+    index: u32,
+    view: vk::ImageView,
+) -> Result<(), Error> {
+    let info = vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .dst_array_element(index)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(std::slice::from_ref(&info));
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+    Ok(())
 }
 
 fn create_set_layout(

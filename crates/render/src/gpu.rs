@@ -75,10 +75,47 @@ impl GpuImage {
         extent: vk::Extent2D,
         format: vk::Format,
     ) -> Result<Self, Error> {
+        Self::create(
+            instance,
+            physical_device,
+            device,
+            extent,
+            format,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_DST,
+        )
+    }
+
+    pub fn color_target(
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &Device,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Result<Self, Error> {
+        Self::create(
+            instance,
+            physical_device,
+            device,
+            extent,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        )
+    }
+
+    fn create(
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &Device,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        features: vk::FormatFeatureFlags,
+    ) -> Result<Self, Error> {
         let props =
             unsafe { instance.get_physical_device_format_properties(physical_device, format) };
-        let needed = vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_DST;
-        if !props.optimal_tiling_features.contains(needed) {
+        if !props.optimal_tiling_features.contains(features) {
             return Err(Error::UnsupportedFormat);
         }
 
@@ -94,7 +131,7 @@ impl GpuImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&image_info, None)? };

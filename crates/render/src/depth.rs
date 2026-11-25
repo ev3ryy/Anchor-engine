@@ -7,6 +7,8 @@ pub struct DepthBuffer {
     memory: vk::DeviceMemory,
     pub image: vk::Image,
     pub view: vk::ImageView,
+    pub extent: vk::Extent2D,
+    pub layout: vk::ImageLayout,
 }
 
 impl Drop for DepthBuffer {
@@ -110,6 +112,8 @@ pub fn create(
         memory,
         image,
         view,
+        extent,
+        layout: vk::ImageLayout::UNDEFINED,
     })
 }
 

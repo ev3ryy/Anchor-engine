@@ -12,9 +12,12 @@ mod shader;
 mod surface;
 mod swapchain;
 mod sync;
+mod texture;
+mod viewport;
 
 pub use camera::Camera;
-pub use material::{MaterialDesc, MaterialId, SamplerId, TextureId};
+pub use material::{MaterialDesc, MaterialId};
+pub use texture::{SamplerId, TextureId};
 
 pub use ash;
 
@@ -45,6 +48,7 @@ pub enum Error {
     ShaderCompile { file: String, message: String },
     ShaderInterface(String),
     UnknownShader(String),
+    Overlay(String),
 }
 
 impl From<vk::Result> for Error {
@@ -84,6 +88,7 @@ impl std::fmt::Display for Error {
             }
             Self::ShaderInterface(message) => write!(f, "{message}"),
             Self::UnknownShader(name) => write!(f, "unknown shader {name}"),
+            Self::Overlay(message) => write!(f, "{message}"),
         }
     }
 }
@@ -112,7 +117,8 @@ impl std::error::Error for Error {
             | Self::StaleMaterial
             | Self::ShaderCompile { .. }
             | Self::ShaderInterface(_)
-            | Self::UnknownShader(_) => None,
+            | Self::UnknownShader(_)
+            | Self::Overlay(_) => None,
         }
     }
 }
@@ -129,8 +135,28 @@ pub enum DrawStatus {
     OutOfDate,
 }
 
+/// Where the scene is drawn. The overlay always targets the swapchain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderTarget {
+    /// Scene and overlay share the window image.
+    Swapchain,
+    /// Scene goes to an offscreen color image of this pixel size.
+    /// The overlay samples that image while drawing the window.
+    Viewport([u32; 2]),
+}
+
+pub struct Overlay<'a> {
+    pub device: &'a ash::Device,
+    pub command_buffer: vk::CommandBuffer,
+    pub color_view: vk::ImageView,
+    pub extent: vk::Extent2D,
+    pub load_op: vk::AttachmentLoadOp,
+    /// Scene color view when the scene was drawn into a texture.
+    pub scene_view: Option<vk::ImageView>,
+}
+
 pub struct Context {
-    // Drop order: shaders, bindless, sync, commands, swapchain, depth, device, surface, instance.
+    // Drop order: shaders, bindless, sync, commands, swapchain, viewport, retired viewports, depth, device, surface, instance.
     // The window must outlive this context. ShaderSet drops while the device is still alive,
     // and before the shared bindless pipeline layout.
     shaders: shader::ShaderSet,
@@ -138,6 +164,8 @@ pub struct Context {
     sync: sync::FrameSync,
     commands: commands::CommandBundle,
     swapchain: swapchain::SwapchainBundle,
+    viewport: Option<viewport::ViewportTarget>,
+    retired_viewports: Vec<viewport::ViewportTarget>,
     depth: Option<depth::DepthBuffer>,
     device: device::DeviceBundle,
     surface: surface::SurfaceBundle,
@@ -174,13 +202,6 @@ impl Context {
         )?;
         let sync = sync::create(&device.device)?;
         let depth_format = depth::choose_format(&instance.instance, device.physical_device)?;
-        let depth = create_depth(
-            &instance.instance,
-            device.physical_device,
-            &device.device,
-            swapchain.extent,
-            depth_format,
-        )?;
         let mut bindless = bindless::Bindless::allocate(
             &instance.instance,
             device.physical_device,
@@ -211,7 +232,9 @@ impl Context {
             sync,
             commands,
             swapchain,
-            depth,
+            viewport: None,
+            retired_viewports: Vec::new(),
+            depth: None,
             device,
             surface,
             instance,
@@ -236,21 +259,25 @@ impl Context {
             height,
             self.swapchain.swapchain,
         )?;
-        let depth_format = self.shaders.depth_format();
-        let depth = create_depth(
-            &self.instance.instance,
-            self.device.physical_device,
-            &self.device.device,
-            replacement.extent,
-            depth_format,
-        )?;
         if self.shaders.color_format() != replacement.format {
+            let depth_format = self.shaders.depth_format();
             self.shaders.recreate(replacement.format, depth_format)?;
             self.shaders.flush_retired();
         }
         let _old = std::mem::replace(&mut self.swapchain, replacement);
-        self.depth = depth;
         Ok(())
+    }
+
+    /// Offscreen scene image sampled by the editor viewport.
+    /// Recreated when `width`, `height`, or the swapchain format changes.
+    /// Waits for the previous frame before replacing the image.
+    pub fn scene_target(&mut self, width: u32, height: u32) -> Result<vk::ImageView, Error> {
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidImage);
+        }
+        self.wait_frame()?;
+        self.ensure_viewport(width, height)?;
+        Ok(self.viewport.as_ref().expect("scene target").view())
     }
 
     pub fn create_texture(
@@ -293,17 +320,50 @@ impl Context {
         self.bindless.free_material(id)
     }
 
-    pub fn draw(&mut self, camera: &Camera, material: MaterialId) -> Result<DrawStatus, Error> {
+    pub fn draw(
+        &mut self,
+        camera: &Camera,
+        material: MaterialId,
+        target: RenderTarget,
+        prepare: impl FnOnce(vk::Queue) -> Result<(), Error>,
+        overlay: impl FnOnce(Overlay<'_>) -> Result<(), Error>,
+    ) -> Result<DrawStatus, Error> {
+        self.wait_frame()?;
+        prepare(self.device.graphics.handle)?;
+
         if self.swapchain.extent.width == 0 || self.swapchain.extent.height == 0 {
             return Ok(DrawStatus::Ok);
         }
-        let Some((depth_image, depth_view)) =
-            self.depth.as_ref().map(|depth| (depth.image, depth.view))
-        else {
-            return Ok(DrawStatus::Ok);
-        };
 
-        self.wait_frame()?;
+        let kind = match target {
+            RenderTarget::Swapchain => SceneKind::Swapchain,
+            RenderTarget::Viewport([width, height]) if width > 0 && height > 0 => {
+                self.ensure_viewport(width, height)?;
+                let viewport = self.viewport.as_ref().expect("scene target");
+                SceneKind::Viewport(ScenePass {
+                    image: viewport.image(),
+                    view: viewport.view(),
+                    layout: viewport.layout,
+                    extent: viewport.extent,
+                    offscreen: true,
+                })
+            }
+            RenderTarget::Viewport(_) => SceneKind::None,
+        };
+        let draws_scene = !matches!(kind, SceneKind::None);
+        let scene_extent = match &kind {
+            SceneKind::Viewport(scene) => scene.extent,
+            SceneKind::Swapchain | SceneKind::None => self.swapchain.extent,
+        };
+        if draws_scene {
+            self.ensure_depth(scene_extent)?;
+        }
+        let depth = self.depth.as_ref().map(|depth| DepthPass {
+            image: depth.image,
+            view: depth.view,
+            layout: depth.layout,
+        });
+
         self.shaders.flush_retired();
         self.bindless.flush();
         self.shaders.poll();
@@ -324,13 +384,33 @@ impl Context {
         };
 
         let index = image_index as usize;
-        let image = self.swapchain.images[index];
-        let view = self.swapchain.views[index];
+        let swapchain_image = self.swapchain.images[index];
+        let swapchain_view = self.swapchain.views[index];
         let signal = self.swapchain.render_finished[index];
-        let extent = self.swapchain.extent;
-        let drawn = self.shaders.pipeline("triangle", &[])?;
+        let swapchain_extent = self.swapchain.extent;
+        let swapchain_layout = self.swapchain.layouts[index];
+        let scene = match kind {
+            SceneKind::Swapchain => Some(ScenePass {
+                image: swapchain_image,
+                view: swapchain_view,
+                layout: swapchain_layout,
+                extent: swapchain_extent,
+                offscreen: false,
+            }),
+            SceneKind::Viewport(scene) => Some(scene),
+            SceneKind::None => None,
+        };
+        let drawn = if scene.is_some() {
+            Some(self.shaders.pipeline("triangle", &[])?)
+        } else {
+            None
+        };
+        let frame_extent = scene
+            .as_ref()
+            .map(|scene| scene.extent)
+            .unwrap_or(swapchain_extent);
         let frame = material::FramePush {
-            view_proj: camera.view_proj(extent).to_cols_array(),
+            view_proj: camera.view_proj(frame_extent).to_cols_array(),
             material_index,
             pad0: 0,
             pad1: 0,
@@ -341,30 +421,42 @@ impl Context {
         let image_available = self.sync.image_available;
         let in_flight = self.sync.in_flight;
         let queue = self.device.graphics.handle;
+        let offscreen = scene.as_ref().is_some_and(|scene| scene.offscreen);
 
         self.commands.record(|device, command_buffer| {
             record_material_visibility(device, command_buffer, material_buffers);
             record_frame(
                 device,
                 command_buffer,
-                image,
-                view,
-                depth_image,
-                depth_view,
-                extent,
-                drawn.pipeline,
-                drawn.layout,
-                drawn.push_stages,
-                drawn.push_offset,
-                drawn.push_size,
+                swapchain_image,
+                swapchain_view,
+                swapchain_extent,
+                swapchain_layout,
+                scene,
+                depth,
+                drawn,
                 descriptor_set,
                 &frame,
+                overlay,
             )
         })?;
+        // The overlay rebinds the scene view before sampling it. The previous image can go now.
+        self.retired_viewports.clear();
 
         unsafe { self.device.device.reset_fences(&[in_flight])? };
         self.commands
             .submit_frame(queue, image_available, signal, in_flight)?;
+        self.swapchain.layouts[index] = vk::ImageLayout::PRESENT_SRC_KHR;
+        if offscreen
+            && let Some(viewport) = self.viewport.as_mut()
+        {
+            viewport.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        }
+        if draws_scene
+            && let Some(depth) = self.depth.as_mut()
+        {
+            depth.layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+        }
 
         let wait_semaphores = [signal];
         let swapchains = [self.swapchain.swapchain];
@@ -387,6 +479,18 @@ impl Context {
         }
     }
 
+    pub fn device(&self) -> &ash::Device {
+        &self.device.device
+    }
+
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance.instance
+    }
+
+    pub fn color_format(&self) -> vk::Format {
+        self.swapchain.format
+    }
+
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.device.physical_device
     }
@@ -397,6 +501,48 @@ impl Context {
 
     pub fn graphics_queue(&self) -> vk::Queue {
         self.device.graphics.handle
+    }
+
+    fn ensure_viewport(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        let format = self.swapchain.format;
+        let extent = vk::Extent2D { width, height };
+        if self
+            .viewport
+            .as_ref()
+            .is_some_and(|target| target.extent == extent && target.format == format)
+        {
+            return Ok(());
+        }
+        let next = viewport::ViewportTarget::create(
+            &self.instance.instance,
+            self.device.physical_device,
+            &self.device.device,
+            extent,
+            format,
+        )?;
+        if let Some(previous) = self.viewport.replace(next) {
+            self.retired_viewports.push(previous);
+        }
+        Ok(())
+    }
+
+    fn ensure_depth(&mut self, extent: vk::Extent2D) -> Result<(), Error> {
+        if self
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.extent == extent)
+        {
+            return Ok(());
+        }
+        let format = self.shaders.depth_format();
+        self.depth = create_depth(
+            &self.instance.instance,
+            self.device.physical_device,
+            &self.device.device,
+            extent,
+            format,
+        )?;
+        Ok(())
     }
 
     fn wait_frame(&self) -> Result<(), Error> {
@@ -414,6 +560,29 @@ impl Context {
     ) -> Result<(), Error> {
         self.commands.submit(self.device.graphics.handle, record)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SceneKind {
+    Swapchain,
+    Viewport(ScenePass),
+    None,
+}
+
+#[derive(Clone, Copy)]
+struct ScenePass {
+    image: vk::Image,
+    view: vk::ImageView,
+    layout: vk::ImageLayout,
+    extent: vk::Extent2D,
+    offscreen: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DepthPass {
+    image: vk::Image,
+    view: vk::ImageView,
+    layout: vk::ImageLayout,
 }
 
 fn create_depth(
@@ -455,67 +624,152 @@ fn record_material_visibility(
 fn record_frame(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    view: vk::ImageView,
-    depth_image: vk::Image,
+    swapchain_image: vk::Image,
+    swapchain_view: vk::ImageView,
+    swapchain_extent: vk::Extent2D,
+    swapchain_layout: vk::ImageLayout,
+    scene: Option<ScenePass>,
+    depth: Option<DepthPass>,
+    drawn: Option<shader::DrawBinding>,
+    descriptor_set: vk::DescriptorSet,
+    frame: &material::FramePush,
+    overlay: impl FnOnce(Overlay<'_>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let color_range = color_range();
+    if let Some(scene) = scene {
+        let Some(depth) = depth else {
+            return Err(Error::NoDepthFormat);
+        };
+        let Some(drawn) = drawn else {
+            return Err(Error::UnknownShader("triangle".to_string()));
+        };
+        let (src_stage, src_access) = color_source(scene.layout);
+        let to_color = image_barrier(
+            scene.image,
+            color_range,
+            src_stage,
+            src_access,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            scene.layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let (depth_stage, depth_access) = depth_source(depth.layout);
+        let to_depth = image_barrier(
+            depth.image,
+            depth_range(),
+            depth_stage,
+            depth_access,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            depth.layout,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+        );
+        cmd_barriers(device, command_buffer, &[to_color, to_depth]);
+        record_scene(
+            device,
+            command_buffer,
+            scene,
+            depth.view,
+            drawn,
+            descriptor_set,
+            frame,
+        )?;
+        if scene.offscreen {
+            let to_sample = image_barrier(
+                scene.image,
+                color_range,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            let to_overlay =
+                swapchain_color_barrier(swapchain_image, color_range, swapchain_layout);
+            cmd_barriers(device, command_buffer, &[to_sample, to_overlay]);
+        } else {
+            let between = image_barrier(
+                swapchain_image,
+                color_range,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            );
+            cmd_barriers(device, command_buffer, &[between]);
+        }
+    } else {
+        cmd_barriers(
+            device,
+            command_buffer,
+            &[swapchain_color_barrier(
+                swapchain_image,
+                color_range,
+                swapchain_layout,
+            )],
+        );
+    }
+
+    let offscreen = scene.is_some_and(|scene| scene.offscreen);
+    overlay(Overlay {
+        device,
+        command_buffer,
+        color_view: swapchain_view,
+        extent: swapchain_extent,
+        load_op: if offscreen || scene.is_none() {
+            vk::AttachmentLoadOp::CLEAR
+        } else {
+            vk::AttachmentLoadOp::LOAD
+        },
+        scene_view: scene
+            .filter(|scene| scene.offscreen)
+            .map(|scene| scene.view),
+    })?;
+
+    let to_present = image_barrier(
+        swapchain_image,
+        color_range,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags2::NONE,
+        vk::AccessFlags2::NONE,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+    );
+    cmd_barriers(device, command_buffer, &[to_present]);
+    Ok(())
+}
+
+fn record_scene(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    scene: ScenePass,
     depth_view: vk::ImageView,
-    extent: vk::Extent2D,
-    pipeline: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    push_stages: vk::ShaderStageFlags,
-    push_offset: u32,
-    push_size: u32,
+    drawn: shader::DrawBinding,
     descriptor_set: vk::DescriptorSet,
     frame: &material::FramePush,
 ) -> Result<(), Error> {
-    let range = vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
-    let to_color = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(range);
-    let depth_range = vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::DEPTH,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
-    let to_depth = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+    if drawn.push_size as usize != std::mem::size_of::<material::FramePush>() {
+        return Err(Error::ShaderInterface(format!(
+            "frame push is {} bytes, shader contract is {}",
+            std::mem::size_of::<material::FramePush>(),
+            drawn.push_size
+        )));
+    }
+    let frame_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (frame as *const material::FramePush).cast::<u8>(),
+            drawn.push_size as usize,
         )
-        .dst_access_mask(
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        )
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(depth_image)
-        .subresource_range(depth_range);
-    let barriers = [to_color, to_depth];
-    let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
-
+    };
     let attachment = vk::RenderingAttachmentInfo::default()
-        .image_view(view)
+        .image_view(scene.view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
@@ -538,44 +792,31 @@ fn record_frame(
     let rendering = vk::RenderingInfo::default()
         .render_area(vk::Rect2D {
             offset: vk::Offset2D::default(),
-            extent,
+            extent: scene.extent,
         })
         .layer_count(1)
         .color_attachments(std::slice::from_ref(&attachment))
         .depth_attachment(&depth_attachment);
-    if push_size as usize != std::mem::size_of::<material::FramePush>() {
-        return Err(Error::ShaderInterface(format!(
-            "frame push is {} bytes, shader contract is {push_size}",
-            std::mem::size_of::<material::FramePush>()
-        )));
-    }
-    let frame_bytes = unsafe {
-        std::slice::from_raw_parts(
-            (frame as *const material::FramePush).cast::<u8>(),
-            push_size as usize,
-        )
-    };
-    let mut bound_layout = vk::PipelineLayout::null();
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        if bound_layout != layout {
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-            bound_layout = layout;
-        }
-        debug_assert_eq!(bound_layout, layout);
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            drawn.pipeline,
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            drawn.layout,
+            0,
+            &[descriptor_set],
+            &[],
+        );
         device.cmd_push_constants(
             command_buffer,
-            layout,
-            push_stages,
-            push_offset,
+            drawn.layout,
+            drawn.push_stages,
+            drawn.push_offset,
             frame_bytes,
         );
         device.cmd_set_viewport(
@@ -584,8 +825,8 @@ fn record_frame(
             &[vk::Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
+                width: scene.extent.width as f32,
+                height: scene.extent.height as f32,
                 min_depth: 0.0,
                 max_depth: 1.0,
             }],
@@ -595,26 +836,108 @@ fn record_frame(
             0,
             &[vk::Rect2D {
                 offset: vk::Offset2D::default(),
-                extent,
+                extent: scene.extent,
             }],
         );
         device.cmd_draw(command_buffer, 36, 1, 0, 0);
         device.cmd_end_rendering(command_buffer);
     }
+    Ok(())
+}
 
-    let to_present = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-        .dst_access_mask(vk::AccessFlags2::NONE)
-        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+fn swapchain_color_barrier(
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier2<'static> {
+    let (src_stage, src_access) = color_source(layout);
+    image_barrier(
+        image,
+        range,
+        src_stage,
+        src_access,
+        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        layout,
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    )
+}
+
+fn color_source(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+        (
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        )
+    } else {
+        (
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::NONE,
+        )
+    }
+}
+
+fn depth_source(layout: vk::ImageLayout) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    if layout == vk::ImageLayout::UNDEFINED {
+        (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE)
+    } else {
+        (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+    }
+}
+
+fn image_barrier(
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(range);
-    let to_present =
-        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present));
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &to_present) };
-    Ok(())
+        .subresource_range(range)
+}
+
+fn cmd_barriers(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    barriers: &[vk::ImageMemoryBarrier2],
+) {
+    let dependency = vk::DependencyInfo::default().image_memory_barriers(barriers);
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+}
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+fn depth_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::DEPTH,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
 }

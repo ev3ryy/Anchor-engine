@@ -7,12 +7,14 @@ use window::winit::keyboard::PhysicalKey;
 use window::winit::window::{Window, WindowId};
 
 pub struct App {
+    editor: Option<editor::Editor>,
     render: Option<render::Context>,
     window: Option<Window>,
     input: input::Input,
     camera: render::Camera,
     material: Option<render::MaterialId>,
     last_frame: Option<std::time::Instant>,
+    looking: bool,
 }
 
 impl App {
@@ -20,6 +22,26 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    fn resize_surface(&mut self, width: u32, height: u32) -> Result<(), ()> {
+        let format = {
+            let Some(render) = self.render.as_mut() else {
+                return Ok(());
+            };
+            if let Err(err) = render.resize(width, height) {
+                eprintln!("failed to resize swapchain: {err}");
+                return Err(());
+            }
+            render.color_format()
+        };
+        if let Some(editor) = self.editor.as_mut()
+            && let Err(err) = editor.sync_format(format)
+        {
+            eprintln!("failed to resize editor: {err}");
+            return Err(());
+        }
+        Ok(())
     }
 }
 
@@ -68,40 +90,52 @@ impl ApplicationHandler for App {
             }
         };
 
+        let editor = match editor::Editor::new(&mut render, &window) {
+            Ok(editor) => editor,
+            Err(err) => {
+                eprintln!("failed to create editor: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
+
         window.request_redraw();
         self.material = Some(material);
+        self.editor = Some(editor);
         self.render = Some(render);
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let egui_repaint = {
+            let App { editor, window, .. } = self;
+            match (editor.as_mut(), window.as_ref()) {
+                (Some(editor), Some(window)) => editor.on_window_event(window, &event),
+                _ => false,
+            }
+        };
+        if egui_repaint {
+            self.request_redraw();
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let Some(render) = self.render.as_mut() else {
-                    return;
-                };
-                if let Err(err) = render.resize(size.width, size.height) {
-                    eprintln!("failed to resize swapchain: {err}");
+                if self.resize_surface(size.width, size.height).is_err() {
                     event_loop.exit();
                     return;
                 }
                 if size.width > 0 && size.height > 0 {
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
-                    }
+                    self.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
                 let Some(material) = self.material else {
                     return;
                 };
-                let Some(render) = self.render.as_mut() else {
+                if self.window.is_none() {
                     return;
-                };
-                let Some(window) = self.window.as_ref() else {
-                    return;
-                };
+                }
                 let now = std::time::Instant::now();
                 let dt = self
                     .last_frame
@@ -109,17 +143,86 @@ impl ApplicationHandler for App {
                     .unwrap_or(0.0)
                     .min(0.1);
                 self.last_frame = Some(now);
-                drive_camera(&mut self.camera, &self.input, dt);
+                let keyboard_captured = self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.wants_keyboard());
+                drive_camera(
+                    &mut self.camera,
+                    &self.input,
+                    dt,
+                    self.looking,
+                    keyboard_captured,
+                );
+                let extent = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.inner_size())
+                    .unwrap_or_default();
+                {
+                    let App {
+                        editor,
+                        camera,
+                        window,
+                        ..
+                    } = self;
+                    if let (Some(editor), Some(window)) = (editor.as_mut(), window.as_ref()) {
+                        editor.begin_frame(
+                            window,
+                            editor::FrameView {
+                                camera,
+                                dt,
+                                extent: [extent.width, extent.height],
+                            },
+                        );
+                    }
+                }
+                let target = self
+                    .editor
+                    .as_ref()
+                    .and_then(|editor| editor.viewport_pixels())
+                    .map(render::RenderTarget::Viewport)
+                    .unwrap_or(render::RenderTarget::Viewport([1, 1]));
+                let editor = std::cell::RefCell::new(self.editor.take());
+                let draw = {
+                    let Some(render) = self.render.as_mut() else {
+                        self.editor = editor.into_inner();
+                        return;
+                    };
+                    render.draw(
+                        &self.camera,
+                        material,
+                        target,
+                        |queue| {
+                            editor
+                                .borrow_mut()
+                                .as_mut()
+                                .map(|editor| editor.prepare(queue))
+                                .unwrap_or(Ok(()))
+                        },
+                        |overlay| {
+                            editor
+                                .borrow_mut()
+                                .as_mut()
+                                .map(|editor| editor.paint(overlay))
+                                .unwrap_or(Ok(()))
+                        },
+                    )
+                };
+                self.editor = editor.into_inner();
                 let mut failed = false;
-                match render.draw(&self.camera, material) {
+                match draw {
                     Ok(render::DrawStatus::Ok) => {}
                     Ok(render::DrawStatus::OutOfDate) => {
-                        let size = window.inner_size();
-                        if let Err(err) = render.resize(size.width, size.height) {
-                            eprintln!("failed to resize swapchain: {err}");
+                        let size = self
+                            .window
+                            .as_ref()
+                            .map(|window| window.inner_size())
+                            .unwrap_or_default();
+                        if self.resize_surface(size.width, size.height).is_err() {
                             failed = true;
                         } else if size.width > 0 && size.height > 0 {
-                            window.request_redraw();
+                            self.request_redraw();
                         }
                     }
                     Err(err) => {
@@ -132,10 +235,18 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                if self.input.any_down() {
-                    let size = window.inner_size();
+                let repaint = self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.wants_repaint());
+                if repaint || self.input.any_down() || self.looking {
+                    let size = self
+                        .window
+                        .as_ref()
+                        .map(|window| window.inner_size())
+                        .unwrap_or_default();
                     if size.width > 0 && size.height > 0 {
-                        window.request_redraw();
+                        self.request_redraw();
                     }
                 }
             }
@@ -161,7 +272,18 @@ impl ApplicationHandler for App {
                 let Some(button) = map::mouse_button(button) else {
                     return;
                 };
-                self.input.set_mouse_button(button, state.is_pressed());
+                let pressed = state.is_pressed();
+                if button == input::MouseButton::Right {
+                    if pressed {
+                        let cursor = self.input.cursor();
+                        self.looking = self.editor.as_ref().is_some_and(|editor| {
+                            editor.pointer_in_viewport(cursor) && !editor.egui_is_using_pointer()
+                        });
+                    } else {
+                        self.looking = false;
+                    }
+                }
+                self.input.set_mouse_button(button, pressed);
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -178,7 +300,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (x, y) = map::scroll(delta);
-                self.input.add_scroll(x, y);
+                let cursor = self.input.cursor();
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.pointer_in_viewport(cursor))
+                {
+                    self.input.add_scroll(x, y);
+                }
                 self.request_redraw();
             }
             WindowEvent::Focused(focused) => {
@@ -209,12 +338,14 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut App {
+        editor: None,
         render: None,
         window: None,
         input: input::Input::default(),
         camera: render::Camera::new(),
         material: None,
         last_frame: None,
+        looking: false,
     })
 }
 
@@ -230,28 +361,36 @@ fn checker(size: u32) -> Vec<u8> {
     pixels
 }
 
-fn drive_camera(camera: &mut render::Camera, input: &input::Input, dt: f32) {
+fn drive_camera(
+    camera: &mut render::Camera,
+    input: &input::Input,
+    dt: f32,
+    looking: bool,
+    keyboard_captured: bool,
+) {
     let mut wish = [0.0; 3];
-    if input.key(input::Key::D) {
-        wish[0] += 1.0;
-    }
-    if input.key(input::Key::A) {
-        wish[0] -= 1.0;
-    }
-    if input.key(input::Key::E) {
-        wish[1] += 1.0;
-    }
-    if input.key(input::Key::Q) {
-        wish[1] -= 1.0;
-    }
-    if input.key(input::Key::W) {
-        wish[2] += 1.0;
-    }
-    if input.key(input::Key::S) {
-        wish[2] -= 1.0;
+    if !keyboard_captured {
+        if input.key(input::Key::D) {
+            wish[0] += 1.0;
+        }
+        if input.key(input::Key::A) {
+            wish[0] -= 1.0;
+        }
+        if input.key(input::Key::E) {
+            wish[1] += 1.0;
+        }
+        if input.key(input::Key::Q) {
+            wish[1] -= 1.0;
+        }
+        if input.key(input::Key::W) {
+            wish[2] += 1.0;
+        }
+        if input.key(input::Key::S) {
+            wish[2] -= 1.0;
+        }
     }
 
-    let look = if input.mouse_button(input::MouseButton::Right) {
+    let look = if looking {
         input.mouse_delta()
     } else {
         [0.0, 0.0]

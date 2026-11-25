@@ -11,6 +11,7 @@ pub struct SwapchainBundle {
     pub render_finished: Vec<vk::Semaphore>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
+    pub layouts: Vec<vk::ImageLayout>,
 }
 
 impl Drop for SwapchainBundle {
@@ -108,6 +109,7 @@ pub fn create(
         }
     }
 
+    let layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
     Ok(SwapchainBundle {
         device: device.clone(),
         loader,
@@ -117,6 +119,7 @@ pub fn create(
         render_finished,
         format,
         extent,
+        layouts,
     })
 }
 

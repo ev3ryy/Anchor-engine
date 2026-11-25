@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+editor = { path = "../editor" }
 input = { path = "../input" }
 render = { path = "../render" }
 window = { path = "../window" }

@@ -42,6 +42,22 @@ impl Camera {
         }
     }
 
+    pub fn position(&self) -> glam::Vec3 {
+        self.position
+    }
+
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
     pub fn scroll_speed(&mut self, lines: f32) {
         self.speed = (self.speed * 1.1_f32.powf(lines)).clamp(MIN_SPEED, MAX_SPEED);
     }

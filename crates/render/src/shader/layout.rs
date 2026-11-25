@@ -28,10 +28,17 @@ impl PushRange {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PushContract {
     pub offset: u32,
     pub size: u32,
+}
+
+pub const FRAME_PUSH_BYTES: u32 = 80;
+
+pub fn frame_push_stages() -> vk::ShaderStageFlags {
+    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +47,7 @@ pub struct StageBinding {
     pub binding: u32,
     pub ty: vk::DescriptorType,
     pub count: u32,
+    pub runtime_array: bool,
     pub stages: vk::ShaderStageFlags,
 }
 
@@ -48,6 +56,7 @@ pub struct Binding {
     pub binding: u32,
     pub ty: vk::DescriptorType,
     pub count: u32,
+    pub runtime_array: bool,
     pub stages: vk::ShaderStageFlags,
 }
 
@@ -148,6 +157,7 @@ pub fn merge_push_ranges(
     Ok(collapsed)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn covering(ranges: &[PushRange], contract: PushContract) -> Option<&PushRange> {
     let end = contract.offset.checked_add(contract.size)?;
     ranges.iter().find(|range| {
@@ -176,7 +186,10 @@ pub fn plan_sets(bindings: &[StageBinding], max_sets: u32) -> Result<SetPlan, St
     for binding in bindings {
         let set = &mut sets[binding.set as usize];
         if let Some(existing) = set.iter_mut().find(|slot| slot.binding == binding.binding) {
-            if existing.ty != binding.ty || existing.count != binding.count {
+            if existing.ty != binding.ty
+                || existing.count != binding.count
+                || existing.runtime_array != binding.runtime_array
+            {
                 return Err(format!(
                     "descriptor set {} binding {} is declared with different types",
                     binding.set, binding.binding
@@ -188,6 +201,7 @@ pub fn plan_sets(bindings: &[StageBinding], max_sets: u32) -> Result<SetPlan, St
                 binding: binding.binding,
                 ty: binding.ty,
                 count: binding.count,
+                runtime_array: binding.runtime_array,
                 stages: binding.stages,
             });
         }
@@ -296,6 +310,7 @@ mod tests {
                     binding: 0,
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     count: 1,
+                    runtime_array: false,
                     stages: VERTEX,
                 },
                 StageBinding {
@@ -303,6 +318,7 @@ mod tests {
                     binding: 2,
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     count: 1,
+                    runtime_array: false,
                     stages: FRAGMENT,
                 },
                 StageBinding {
@@ -310,6 +326,7 @@ mod tests {
                     binding: 0,
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     count: 1,
+                    runtime_array: false,
                     stages: VERTEX | FRAGMENT,
                 },
             ],
@@ -333,6 +350,7 @@ mod tests {
                     binding: 0,
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     count: 1,
+                    runtime_array: false,
                     stages: VERTEX,
                 },
                 StageBinding {
@@ -340,6 +358,7 @@ mod tests {
                     binding: 0,
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     count: 1,
+                    runtime_array: false,
                     stages: FRAGMENT,
                 },
             ],

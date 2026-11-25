@@ -11,6 +11,7 @@ pub struct App {
     window: Option<Window>,
     input: input::Input,
     camera: render::Camera,
+    material: Option<render::MaterialId>,
     last_frame: Option<std::time::Instant>,
 }
 
@@ -37,7 +38,7 @@ impl ApplicationHandler for App {
             }
         };
         let size = window.inner_size();
-        let render = match render::Context::new(&window, size.width, size.height) {
+        let mut render = match render::Context::new(&window, size.width, size.height) {
             Ok(render) => render,
             Err(err) => {
                 eprintln!("failed to initialize Vulkan: {err}");
@@ -45,8 +46,30 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        let pixels = checker(64);
+        let texture = match render.create_texture(64, 64, &pixels) {
+            Ok(texture) => texture,
+            Err(err) => {
+                eprintln!("failed to create texture: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let material = match render.create_material(render::MaterialDesc::Unlit {
+            color: [1.0, 0.92, 0.75, 1.0],
+            albedo: texture,
+            sampler: render::SamplerId::LinearRepeat,
+        }) {
+            Ok(material) => material,
+            Err(err) => {
+                eprintln!("failed to create material: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
 
         window.request_redraw();
+        self.material = Some(material);
         self.render = Some(render);
         self.window = Some(window);
     }
@@ -70,6 +93,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let Some(material) = self.material else {
+                    return;
+                };
                 let Some(render) = self.render.as_mut() else {
                     return;
                 };
@@ -85,7 +111,7 @@ impl ApplicationHandler for App {
                 self.last_frame = Some(now);
                 drive_camera(&mut self.camera, &self.input, dt);
                 let mut failed = false;
-                match render.draw(&self.camera) {
+                match render.draw(&self.camera, material) {
                     Ok(render::DrawStatus::Ok) => {}
                     Ok(render::DrawStatus::OutOfDate) => {
                         let size = window.inner_size();
@@ -187,8 +213,21 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
         window: None,
         input: input::Input::default(),
         camera: render::Camera::new(),
+        material: None,
         last_frame: None,
     })
+}
+
+fn checker(size: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let on = (x / 8 + y / 8).is_multiple_of(2);
+            let (red, green, blue) = if on { (230, 120, 40) } else { (25, 32, 48) };
+            pixels.extend_from_slice(&[red, green, blue, 255]);
+        }
+    }
+    pixels
 }
 
 fn drive_camera(camera: &mut render::Camera, input: &input::Input, dt: f32) {

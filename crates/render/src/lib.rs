@@ -1,8 +1,11 @@
+mod bindless;
 mod camera;
 mod commands;
 mod depth;
 mod device;
+mod gpu;
 mod instance;
+mod material;
 mod pipeline;
 mod queue;
 mod shader;
@@ -11,6 +14,7 @@ mod swapchain;
 mod sync;
 
 pub use camera::Camera;
+pub use material::{MaterialDesc, MaterialId, SamplerId, TextureId};
 
 pub use ash;
 
@@ -27,9 +31,16 @@ pub enum Error {
     NoGraphicsQueue,
     NoPresentQueue,
     NoMaintenance5,
+    NoBindless,
     NoSurfaceFormat,
     NoDepthFormat,
     NoMemoryType,
+    UnsupportedFormat,
+    InvalidImage,
+    OutOfTextures,
+    OutOfMaterials,
+    StaleTexture,
+    StaleMaterial,
     Shader(std::io::Error),
     ShaderCompile { file: String, message: String },
     ShaderInterface(String),
@@ -57,9 +68,16 @@ impl std::fmt::Display for Error {
             Self::NoGraphicsQueue => write!(f, "no graphics queue family found"),
             Self::NoPresentQueue => write!(f, "no graphics queue supports presentation"),
             Self::NoMaintenance5 => write!(f, "no device supports VK_KHR_maintenance5"),
+            Self::NoBindless => write!(f, "no device supports bindless materials"),
             Self::NoSurfaceFormat => write!(f, "no surface format found"),
             Self::NoDepthFormat => write!(f, "no supported depth format found"),
             Self::NoMemoryType => write!(f, "no suitable device memory type found"),
+            Self::UnsupportedFormat => write!(f, "texture format is not supported"),
+            Self::InvalidImage => write!(f, "texture byte length does not match its extent"),
+            Self::OutOfTextures => write!(f, "bindless texture heap is full"),
+            Self::OutOfMaterials => write!(f, "material table is full"),
+            Self::StaleTexture => write!(f, "texture handle is stale"),
+            Self::StaleMaterial => write!(f, "material handle is stale"),
             Self::Shader(err) => write!(f, "failed to read SPIR-V: {err}"),
             Self::ShaderCompile { file, message } => {
                 write!(f, "failed to compile {file}: {message}")
@@ -82,9 +100,16 @@ impl std::error::Error for Error {
             | Self::NoGraphicsQueue
             | Self::NoPresentQueue
             | Self::NoMaintenance5
+            | Self::NoBindless
             | Self::NoSurfaceFormat
             | Self::NoDepthFormat
             | Self::NoMemoryType
+            | Self::UnsupportedFormat
+            | Self::InvalidImage
+            | Self::OutOfTextures
+            | Self::OutOfMaterials
+            | Self::StaleTexture
+            | Self::StaleMaterial
             | Self::ShaderCompile { .. }
             | Self::ShaderInterface(_)
             | Self::UnknownShader(_) => None,
@@ -105,9 +130,11 @@ pub enum DrawStatus {
 }
 
 pub struct Context {
-    // Drop order: shaders, sync, commands, swapchain, depth, device, surface, instance.
-    // The window must outlive this context. ShaderSet drops while the device is still alive.
+    // Drop order: shaders, bindless, sync, commands, swapchain, depth, device, surface, instance.
+    // The window must outlive this context. ShaderSet drops while the device is still alive,
+    // and before the shared bindless pipeline layout.
     shaders: shader::ShaderSet,
+    bindless: bindless::Bindless,
     sync: sync::FrameSync,
     commands: commands::CommandBundle,
     swapchain: swapchain::SwapchainBundle,
@@ -154,15 +181,33 @@ impl Context {
             swapchain.extent,
             depth_format,
         )?;
+        let mut bindless = bindless::Bindless::allocate(
+            &instance.instance,
+            device.physical_device,
+            &device.device,
+            device.texture_capacity,
+        )?;
+        bindless.prepare_white()?;
+        let (staging, image, upload_extent) = bindless.upload_source();
+        if let Err(err) = commands.submit(device.graphics.handle, move |device, command_buffer| {
+            gpu::record_image_upload(device, command_buffer, staging, image, upload_extent);
+            Ok(())
+        }) {
+            bindless.cancel_upload();
+            return Err(err);
+        }
+        let _white = bindless.finish_upload()?;
         let shaders = shader::ShaderSet::new(
             &instance.instance,
             device.physical_device,
             &device.device,
             swapchain.format,
             depth_format,
+            bindless.pipeline_layout(),
         )?;
         Ok(Self {
             shaders,
+            bindless,
             sync,
             commands,
             swapchain,
@@ -180,6 +225,7 @@ impl Context {
 
         unsafe { self.device.device.device_wait_idle() }?;
         self.shaders.flush_retired();
+        self.bindless.flush();
         let replacement = swapchain::create(
             &self.instance.instance,
             &self.device.device,
@@ -207,7 +253,47 @@ impl Context {
         Ok(())
     }
 
-    pub fn draw(&mut self, camera: &Camera) -> Result<DrawStatus, Error> {
+    pub fn create_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<TextureId, Error> {
+        self.wait_frame()?;
+        self.shaders.flush_retired();
+        self.bindless.flush();
+        self.bindless.prepare_texture(width, height, pixels)?;
+        let (staging, image, extent) = self.bindless.upload_source();
+        if let Err(err) = self.commands.submit(
+            self.device.graphics.handle,
+            move |device, command_buffer| {
+                gpu::record_image_upload(device, command_buffer, staging, image, extent);
+                Ok(())
+            },
+        ) {
+            self.bindless.cancel_upload();
+            return Err(err);
+        }
+        self.bindless.finish_upload()
+    }
+
+    pub fn free_texture(&mut self, id: TextureId) -> Result<(), Error> {
+        self.bindless.free_texture(id)
+    }
+
+    pub fn create_material(&mut self, desc: MaterialDesc) -> Result<MaterialId, Error> {
+        self.bindless.create_material(desc)
+    }
+
+    pub fn update_material(&mut self, id: MaterialId, desc: MaterialDesc) -> Result<(), Error> {
+        self.bindless.update_material(id, desc)
+    }
+
+    pub fn free_material(&mut self, id: MaterialId) -> Result<(), Error> {
+        self.bindless.free_material(id)
+    }
+
+    pub fn draw(&mut self, camera: &Camera, material: MaterialId) -> Result<DrawStatus, Error> {
         if self.swapchain.extent.width == 0 || self.swapchain.extent.height == 0 {
             return Ok(DrawStatus::Ok);
         }
@@ -217,13 +303,11 @@ impl Context {
             return Ok(DrawStatus::Ok);
         };
 
-        unsafe {
-            self.device
-                .device
-                .wait_for_fences(&[self.sync.in_flight], true, u64::MAX)?;
-        }
+        self.wait_frame()?;
         self.shaders.flush_retired();
+        self.bindless.flush();
         self.shaders.poll();
+        let material_index = self.bindless.material_index(material)?;
 
         let acquire = unsafe {
             self.swapchain.loader.acquire_next_image(
@@ -245,12 +329,21 @@ impl Context {
         let signal = self.swapchain.render_finished[index];
         let extent = self.swapchain.extent;
         let drawn = self.shaders.pipeline("triangle", &[])?;
-        let mvp = camera.view_proj(extent).to_cols_array();
+        let frame = material::FramePush {
+            view_proj: camera.view_proj(extent).to_cols_array(),
+            material_index,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        };
+        let descriptor_set = self.bindless.descriptor_set();
+        let material_buffers = self.bindless.material_buffers();
         let image_available = self.sync.image_available;
         let in_flight = self.sync.in_flight;
         let queue = self.device.graphics.handle;
 
         self.commands.record(|device, command_buffer| {
+            record_material_visibility(device, command_buffer, material_buffers);
             record_frame(
                 device,
                 command_buffer,
@@ -264,7 +357,8 @@ impl Context {
                 drawn.push_stages,
                 drawn.push_offset,
                 drawn.push_size,
-                &mvp,
+                descriptor_set,
+                &frame,
             )
         })?;
 
@@ -305,6 +399,15 @@ impl Context {
         self.device.graphics.handle
     }
 
+    fn wait_frame(&self) -> Result<(), Error> {
+        unsafe {
+            self.device
+                .device
+                .wait_for_fences(&[self.sync.in_flight], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
     pub fn submit(
         &mut self,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer) -> Result<(), Error>,
@@ -326,6 +429,29 @@ fn create_depth(
     depth::create(instance, physical_device, device, extent, format).map(Some)
 }
 
+fn record_material_visibility(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    buffers: [vk::Buffer; 2],
+) {
+    let barriers = buffers.map(|buffer| {
+        vk::BufferMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::HOST)
+            .src_access_mask(vk::AccessFlags2::HOST_WRITE)
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            )
+            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)
+    });
+    let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+}
+
 fn record_frame(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -339,7 +465,8 @@ fn record_frame(
     push_stages: vk::ShaderStageFlags,
     push_offset: u32,
     push_size: u32,
-    mvp: &[f32; 16],
+    descriptor_set: vk::DescriptorSet,
+    frame: &material::FramePush,
 ) -> Result<(), Error> {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -416,18 +543,41 @@ fn record_frame(
         .layer_count(1)
         .color_attachments(std::slice::from_ref(&attachment))
         .depth_attachment(&depth_attachment);
-    if push_size as usize > std::mem::size_of_val(mvp) {
+    if push_size as usize != std::mem::size_of::<material::FramePush>() {
         return Err(Error::ShaderInterface(format!(
-            "camera push is {} bytes, shader contract is {push_size}",
-            std::mem::size_of_val(mvp)
+            "frame push is {} bytes, shader contract is {push_size}",
+            std::mem::size_of::<material::FramePush>()
         )));
     }
-    let mvp_bytes =
-        unsafe { std::slice::from_raw_parts(mvp.as_ptr().cast::<u8>(), push_size as usize) };
+    let frame_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (frame as *const material::FramePush).cast::<u8>(),
+            push_size as usize,
+        )
+    };
+    let mut bound_layout = vk::PipelineLayout::null();
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
-        device.cmd_push_constants(command_buffer, layout, push_stages, push_offset, mvp_bytes);
+        if bound_layout != layout {
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            bound_layout = layout;
+        }
+        debug_assert_eq!(bound_layout, layout);
+        device.cmd_push_constants(
+            command_buffer,
+            layout,
+            push_stages,
+            push_offset,
+            frame_bytes,
+        );
         device.cmd_set_viewport(
             command_buffer,
             0,

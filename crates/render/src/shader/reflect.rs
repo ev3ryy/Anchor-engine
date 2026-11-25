@@ -5,8 +5,15 @@ use spirq::ty::{DescriptorType, Type};
 use spirq::var::Variable;
 
 use super::layout::{
-    Binding, Limits, PushRange, SetPlan, StageBinding, StageInterval, merge_push_ranges, plan_sets,
+    Binding, FRAME_PUSH_BYTES, Limits, PushRange, SetPlan, StageBinding, StageInterval,
+    merge_push_ranges, plan_sets,
 };
+
+const BINDLESS_TEXTURES: u32 = 0;
+const BINDLESS_SAMPLERS: u32 = 1;
+const BINDLESS_MATERIALS: u32 = 2;
+const BINDLESS_PARAMS: u32 = 3;
+const SAMPLER_COUNT: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Interface {
@@ -100,17 +107,12 @@ fn reflect_stage(
                 nbind,
                 ..
             } => {
-                if *nbind == 0 {
-                    return Err(format!(
-                        "{entry} binding {} uses an unbounded descriptor array",
-                        desc_bind.bind()
-                    ));
-                }
                 bindings.push(StageBinding {
                     set: desc_bind.set(),
                     binding: desc_bind.bind(),
                     ty: descriptor_type(desc_ty)?,
                     count: *nbind,
+                    runtime_array: *nbind == 0,
                     stages: stage,
                 });
             }
@@ -160,6 +162,77 @@ fn push_span(ty: &Type) -> Result<(u32, u32), String> {
     Ok((offset, size))
 }
 
+pub fn validate_bindless(interface: &Interface) -> Result<(), String> {
+    if interface.sets.len() > 1 {
+        return Err(format!(
+            "shader declares descriptor set {}; only bindless set 0 is available",
+            interface.sets.len() - 1
+        ));
+    }
+    if let Some(set) = interface.sets.first() {
+        for binding in set {
+            match canonical(binding) {
+                Ok(()) => {}
+                Err(message) => return Err(message),
+            }
+        }
+    }
+    for range in &interface.push {
+        let end = range
+            .offset
+            .checked_add(range.size)
+            .ok_or_else(|| "push constant range overflows".to_string())?;
+        if end > FRAME_PUSH_BYTES {
+            return Err(format!(
+                "push constant range {}..{end} is outside the frame block 0..{FRAME_PUSH_BYTES}",
+                range.offset
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical(binding: &Binding) -> Result<(), String> {
+    let (ty, runtime_array, count) = match binding.binding {
+        BINDLESS_TEXTURES => (vk::DescriptorType::SAMPLED_IMAGE, true, 0),
+        BINDLESS_SAMPLERS => (vk::DescriptorType::SAMPLER, false, SAMPLER_COUNT),
+        BINDLESS_MATERIALS | BINDLESS_PARAMS => (vk::DescriptorType::STORAGE_BUFFER, false, 1),
+        other => {
+            return Err(format!(
+                "descriptor set 0 binding {other} is not part of the bindless layout"
+            ));
+        }
+    };
+    if binding.ty != ty {
+        return Err(format!(
+            "descriptor set 0 binding {} has type {:?}, bindless layout declares {ty:?}",
+            binding.binding, binding.ty
+        ));
+    }
+    if runtime_array {
+        if !binding.runtime_array {
+            return Err(format!(
+                "descriptor set 0 binding {} must be a runtime array",
+                binding.binding
+            ));
+        }
+        return Ok(());
+    }
+    if binding.runtime_array {
+        return Err(format!(
+            "descriptor set 0 binding {} cannot be a runtime array",
+            binding.binding
+        ));
+    }
+    if binding.count != count {
+        return Err(format!(
+            "descriptor set 0 binding {} count is {}, bindless layout declares {count}",
+            binding.binding, binding.count
+        ));
+    }
+    Ok(())
+}
+
 fn descriptor_type(ty: &DescriptorType) -> Result<vk::DescriptorType, String> {
     Ok(match ty {
         DescriptorType::Sampler() => vk::DescriptorType::SAMPLER,
@@ -184,13 +257,13 @@ mod tests {
 
     use ash::vk;
 
-    use super::reflect_graphics;
+    use super::{reflect_graphics, validate_bindless};
     use crate::shader::compile::{self, Optimize};
-    use crate::shader::layout::{Limits, PushRange};
+    use crate::shader::layout::{Binding, Limits};
     use crate::shader::words;
 
     #[test]
-    fn reflects_triangle_as_a_vertex_push_constant() {
+    fn reflects_the_bindless_frame_contract() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
         let temp = std::env::temp_dir().join("engine-shader-reflect");
         fs::create_dir_all(&temp).expect("temp dir");
@@ -229,19 +302,38 @@ mod tests {
             },
         )
         .expect("reflect");
-        assert!(interface.sets.is_empty(), "{:?}", interface.sets);
+        validate_bindless(&interface).expect("bindless contract");
         assert!(
             interface.vertex_inputs.is_empty(),
             "{:?}",
             interface.vertex_inputs
         );
-        assert_eq!(
-            interface.push,
-            vec![PushRange {
-                stages: vk::ShaderStageFlags::VERTEX,
-                offset: 0,
-                size: 64,
-            }]
+        let set = interface.sets.first().expect("set 0");
+        let textures = find_binding(set, 0);
+        assert_eq!(textures.ty, vk::DescriptorType::SAMPLED_IMAGE);
+        assert!(textures.runtime_array);
+        assert_eq!(textures.count, 0);
+        let samplers = find_binding(set, 1);
+        assert_eq!(samplers.ty, vk::DescriptorType::SAMPLER);
+        assert_eq!(samplers.count, 4);
+        assert!(!samplers.runtime_array);
+        assert_eq!(find_binding(set, 2).ty, vk::DescriptorType::STORAGE_BUFFER);
+        assert_eq!(find_binding(set, 2).count, 1);
+        assert_eq!(find_binding(set, 3).ty, vk::DescriptorType::STORAGE_BUFFER);
+        assert_eq!(find_binding(set, 3).count, 1);
+        assert!(
+            interface
+                .push
+                .iter()
+                .any(|range| range.offset == 0 && range.size >= 64),
+            "{:?}",
+            interface.push
         );
+    }
+
+    fn find_binding(set: &[Binding], binding: u32) -> &Binding {
+        set.iter()
+            .find(|slot| slot.binding == binding)
+            .unwrap_or_else(|| panic!("missing binding {binding}"))
     }
 }

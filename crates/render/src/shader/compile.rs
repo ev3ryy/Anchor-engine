@@ -21,7 +21,11 @@ pub fn compile_stage(
         .arg(src)
         .args(["-entry", entry, "-stage", stage])
         .args(["-target", "spirv", "-profile", "spirv_1_6"])
-        .args(["-fvk-use-entrypoint-name", "-emit-spirv-directly"])
+        .args([
+            "-fvk-use-entrypoint-name",
+            "-emit-spirv-directly",
+            "-fvk-use-scalar-layout",
+        ])
         .arg(match optimize {
             Optimize::Debug => "-O0",
             Optimize::Release => "-O3",

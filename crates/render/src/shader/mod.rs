@@ -1,7 +1,7 @@
 mod cache;
 #[cfg(any(debug_assertions, test))]
 mod compile;
-mod layout;
+pub(crate) mod layout;
 mod reflect;
 #[cfg(any(debug_assertions, test))]
 mod scan;
@@ -23,8 +23,7 @@ use notify as _;
 
 use crate::Error;
 use crate::pipeline::{self, Modules};
-use layout::{Binding, Limits, PushContract};
-use reflect::Interface;
+use layout::{FRAME_PUSH_BYTES, Limits, frame_push_stages};
 use source::Compiled;
 use state::GraphicsState;
 
@@ -49,20 +48,9 @@ pub struct DrawBinding {
     pub push_size: u32,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct LayoutKey {
-    bindings: Vec<Binding>,
-}
-
-struct SharedLayout {
-    handle: vk::DescriptorSetLayout,
-    refs: usize,
-}
-
 struct Gpu {
     modules: Modules,
     layout: vk::PipelineLayout,
-    keys: Vec<LayoutKey>,
     pipelines: HashMap<Vec<(u32, u32)>, vk::Pipeline>,
 }
 
@@ -70,8 +58,6 @@ impl Gpu {
     fn into_retired(self) -> Retired {
         Retired {
             modules: self.modules,
-            layout: self.layout,
-            keys: self.keys,
             pipelines: self.pipelines.into_values().collect(),
         }
     }
@@ -79,8 +65,6 @@ impl Gpu {
 
 struct Retired {
     modules: Modules,
-    layout: vk::PipelineLayout,
-    keys: Vec<LayoutKey>,
     pipelines: Vec<vk::Pipeline>,
 }
 
@@ -89,9 +73,7 @@ struct Program {
     fragment: Vec<u32>,
     vertex_entry: String,
     fragment_entry: String,
-    interface: Interface,
     state: GraphicsState,
-    push: Option<PushContract>,
     gpu: Gpu,
 }
 
@@ -106,8 +88,7 @@ pub struct ShaderSet {
     device: Device,
     cache: vk::PipelineCache,
     cache_path: Option<PathBuf>,
-    empty_layout: vk::DescriptorSetLayout,
-    layouts: HashMap<LayoutKey, SharedLayout>,
+    pipeline_layout: vk::PipelineLayout,
     programs: HashMap<String, Program>,
     retired: Vec<Retired>,
     limits: Limits,
@@ -125,14 +106,7 @@ impl Drop for ShaderSet {
         for (_, program) in programs {
             self.destroy_retired(program.gpu.into_retired());
         }
-        let layouts = std::mem::take(&mut self.layouts);
         unsafe {
-            for (_, shared) in layouts {
-                self.device
-                    .destroy_descriptor_set_layout(shared.handle, None);
-            }
-            self.device
-                .destroy_descriptor_set_layout(self.empty_layout, None);
             self.device.destroy_pipeline_cache(self.cache, None);
         }
     }
@@ -145,6 +119,7 @@ impl ShaderSet {
         device: &Device,
         color_format: vk::Format,
         depth_format: vk::Format,
+        pipeline_layout: vk::PipelineLayout,
     ) -> Result<Self, Error> {
         let properties = unsafe { instance.get_physical_device_properties(physical_device) };
         let limits = Limits {
@@ -152,21 +127,11 @@ impl ShaderSet {
             max_bound_descriptor_sets: properties.limits.max_bound_descriptor_sets,
         };
         let cache = cache::open(device, &properties.pipeline_cache_uuid)?;
-        let empty_layout = match unsafe {
-            device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default(), None)
-        } {
-            Ok(layout) => layout,
-            Err(err) => {
-                unsafe { device.destroy_pipeline_cache(cache.cache, None) };
-                return Err(err.into());
-            }
-        };
         let mut shaders = Self {
             device: device.clone(),
             cache: cache.cache,
             cache_path: cache.path,
-            empty_layout,
-            layouts: HashMap::new(),
+            pipeline_layout,
             programs: HashMap::new(),
             retired: Vec::new(),
             limits,
@@ -220,27 +185,12 @@ impl ShaderSet {
 
     pub fn pipeline(&mut self, name: &str, spec: &[(u32, u32)]) -> Result<DrawBinding, Error> {
         let key = spec_key(spec)?;
-        let (push_stages, push_offset, push_size, ready) = {
+        let ready = {
             let program = self
                 .programs
                 .get(name)
                 .ok_or_else(|| Error::UnknownShader(name.to_string()))?;
-            let contract = program
-                .push
-                .ok_or_else(|| Error::ShaderInterface(format!("{name} has no push contract")))?;
-            let range = layout::covering(&program.interface.push, contract).ok_or_else(|| {
-                Error::ShaderInterface(format!(
-                    "{name} push range does not cover bytes [{}, {})",
-                    contract.offset,
-                    contract.offset + contract.size
-                ))
-            })?;
-            (
-                range.stages,
-                contract.offset,
-                contract.size,
-                program.gpu.pipelines.contains_key(&key),
-            )
+            program.gpu.pipelines.contains_key(&key)
         };
         if !ready {
             self.create_variant(name, &key)?;
@@ -257,9 +207,9 @@ impl ShaderSet {
         Ok(DrawBinding {
             pipeline,
             layout: program.gpu.layout,
-            push_stages,
-            push_offset,
-            push_size,
+            push_stages: frame_push_stages(),
+            push_offset: 0,
+            push_size: FRAME_PUSH_BYTES,
         })
     }
 
@@ -294,30 +244,20 @@ impl ShaderSet {
             &self.limits,
         )
         .map_err(Error::ShaderInterface)?;
+        reflect::validate_bindless(&interface).map_err(Error::ShaderInterface)?;
         if !interface.vertex_inputs.is_empty() {
             return Err(Error::ShaderInterface(format!(
                 "{} declares vertex inputs at locations {:?} without a vertex layout",
                 compiled.name, interface.vertex_inputs
             )));
         }
-        let desc = state::description(&compiled.name);
-        if let Some(contract) = desc.push
-            && layout::covering(&interface.push, contract).is_none()
-        {
-            return Err(Error::ShaderInterface(format!(
-                "{} push range does not cover bytes [{}, {})",
-                compiled.name,
-                contract.offset,
-                contract.offset + contract.size
-            )));
-        }
+        let state = state::description(&compiled.name);
         let gpu = self.build_gpu(
             &compiled.vertex,
             &compiled.fragment,
             &compiled.vertex_entry,
             &compiled.fragment_entry,
-            &interface,
-            desc.state,
+            state,
             &[Vec::new()],
         )?;
         let name = compiled.name.clone();
@@ -326,9 +266,7 @@ impl ShaderSet {
             fragment: compiled.fragment,
             vertex_entry: compiled.vertex_entry,
             fragment_entry: compiled.fragment_entry,
-            interface,
-            state: desc.state,
-            push: desc.push,
+            state,
             gpu,
         };
         if let Some(old) = self.programs.insert(name, program) {
@@ -338,7 +276,7 @@ impl ShaderSet {
     }
 
     fn rebuild(&mut self, name: &str) -> Result<(), Error> {
-        let (vertex, fragment, vertex_entry, fragment_entry, interface, state, specs) = {
+        let (vertex, fragment, vertex_entry, fragment_entry, state, specs) = {
             let program = self
                 .programs
                 .get(name)
@@ -348,7 +286,6 @@ impl ShaderSet {
                 program.fragment.clone(),
                 program.vertex_entry.clone(),
                 program.fragment_entry.clone(),
-                program.interface.clone(),
                 program.state,
                 program.gpu.pipelines.keys().cloned().collect::<Vec<_>>(),
             )
@@ -358,7 +295,6 @@ impl ShaderSet {
             &fragment,
             &vertex_entry,
             &fragment_entry,
-            &interface,
             state,
             &specs,
         )?;
@@ -377,22 +313,15 @@ impl ShaderSet {
         fragment: &[u32],
         vertex_entry: &str,
         fragment_entry: &str,
-        interface: &Interface,
         state: GraphicsState,
         specs: &[Vec<(u32, u32)>],
     ) -> Result<Gpu, Error> {
         let modules = pipeline::create_modules(&self.device, vertex, fragment)?;
-        let (layout, keys) = match self.create_pipeline_layout(interface) {
-            Ok(created) => created,
-            Err(err) => {
-                destroy_modules(&self.device, modules);
-                return Err(err);
-            }
-        };
+        let layout = self.pipeline_layout;
         let vertex_name = match CString::new(vertex_entry) {
             Ok(name) => name,
             Err(_) => {
-                self.abandon(modules, layout, keys, Vec::new());
+                self.abandon(modules, Vec::new());
                 return Err(Error::ShaderInterface(
                     "vertex entry name contains nul".into(),
                 ));
@@ -401,7 +330,7 @@ impl ShaderSet {
         let fragment_name = match CString::new(fragment_entry) {
             Ok(name) => name,
             Err(_) => {
-                self.abandon(modules, layout, keys, Vec::new());
+                self.abandon(modules, Vec::new());
                 return Err(Error::ShaderInterface(
                     "fragment entry name contains nul".into(),
                 ));
@@ -425,7 +354,7 @@ impl ShaderSet {
                     pipelines.insert(spec.clone(), pipeline);
                 }
                 Err(err) => {
-                    self.abandon(modules, layout, keys, pipelines.into_values().collect());
+                    self.abandon(modules, pipelines.into_values().collect());
                     return Err(err);
                 }
             }
@@ -433,7 +362,6 @@ impl ShaderSet {
         Ok(Gpu {
             modules,
             layout,
-            keys,
             pipelines,
         })
     }
@@ -480,109 +408,8 @@ impl ShaderSet {
         Ok(())
     }
 
-    fn create_pipeline_layout(
-        &mut self,
-        interface: &Interface,
-    ) -> Result<(vk::PipelineLayout, Vec<LayoutKey>), Error> {
-        let mut handles = Vec::with_capacity(interface.sets.len());
-        let mut keys = Vec::new();
-        for bindings in &interface.sets {
-            if bindings.is_empty() {
-                handles.push(self.empty_layout);
-                continue;
-            }
-            match self.acquire_layout(bindings) {
-                Ok((handle, key)) => {
-                    handles.push(handle);
-                    keys.push(key);
-                }
-                Err(err) => {
-                    self.release_keys(&keys);
-                    return Err(err);
-                }
-            }
-        }
-        let push_constants: Vec<_> = interface
-            .push
-            .iter()
-            .map(|range| {
-                vk::PushConstantRange::default()
-                    .stage_flags(range.stages)
-                    .offset(range.offset)
-                    .size(range.size)
-            })
-            .collect();
-        let info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&handles)
-            .push_constant_ranges(&push_constants);
-        match unsafe { self.device.create_pipeline_layout(&info, None) } {
-            Ok(layout) => Ok((layout, keys)),
-            Err(err) => {
-                self.release_keys(&keys);
-                Err(err.into())
-            }
-        }
-    }
-
-    fn acquire_layout(
-        &mut self,
-        bindings: &[Binding],
-    ) -> Result<(vk::DescriptorSetLayout, LayoutKey), Error> {
-        let key = LayoutKey {
-            bindings: bindings.to_vec(),
-        };
-        if let Some(shared) = self.layouts.get_mut(&key) {
-            shared.refs += 1;
-            return Ok((shared.handle, key));
-        }
-        let vk_bindings: Vec<_> = bindings
-            .iter()
-            .map(|binding| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding.binding)
-                    .descriptor_type(binding.ty)
-                    .descriptor_count(binding.count)
-                    .stage_flags(binding.stages)
-            })
-            .collect();
-        let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
-        let handle = unsafe { self.device.create_descriptor_set_layout(&info, None)? };
-        self.layouts
-            .insert(key.clone(), SharedLayout { handle, refs: 1 });
-        Ok((handle, key))
-    }
-
-    fn release_keys(&mut self, keys: &[LayoutKey]) {
-        for key in keys {
-            let Some(shared) = self.layouts.get_mut(key) else {
-                continue;
-            };
-            shared.refs = shared.refs.saturating_sub(1);
-            if shared.refs == 0 {
-                let Some(shared) = self.layouts.remove(key) else {
-                    continue;
-                };
-                unsafe {
-                    self.device
-                        .destroy_descriptor_set_layout(shared.handle, None);
-                }
-            }
-        }
-    }
-
-    fn abandon(
-        &mut self,
-        modules: Modules,
-        layout: vk::PipelineLayout,
-        keys: Vec<LayoutKey>,
-        pipelines: Vec<vk::Pipeline>,
-    ) {
-        self.destroy_retired(Retired {
-            modules,
-            layout,
-            keys,
-            pipelines,
-        });
+    fn abandon(&mut self, modules: Modules, pipelines: Vec<vk::Pipeline>) {
+        self.destroy_retired(Retired { modules, pipelines });
     }
 
     fn destroy_retired(&mut self, retired: Retired) {
@@ -592,11 +419,7 @@ impl ShaderSet {
                     self.device.destroy_pipeline(pipeline, None);
                 }
             }
-            if retired.layout != vk::PipelineLayout::null() {
-                self.device.destroy_pipeline_layout(retired.layout, None);
-            }
         }
-        self.release_keys(&retired.keys);
         destroy_modules(&self.device, retired.modules);
     }
 

@@ -1,7 +1,5 @@
 use ash::vk;
 
-use super::layout::PushContract;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlendMode {
     Opaque,
@@ -33,24 +31,6 @@ impl GraphicsState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ProgramDesc {
-    pub state: GraphicsState,
-    pub push: Option<PushContract>,
-}
-
-pub fn description(name: &str) -> ProgramDesc {
-    match name {
-        "triangle" => ProgramDesc {
-            state: GraphicsState::opaque_mesh(),
-            push: Some(PushContract {
-                offset: 0,
-                size: std::mem::size_of::<[f32; 16]>() as u32,
-            }),
-        },
-        _ => ProgramDesc {
-            state: GraphicsState::opaque_mesh(),
-            push: None,
-        },
-    }
+pub fn description(_name: &str) -> GraphicsState {
+    GraphicsState::opaque_mesh()
 }

@@ -2,6 +2,9 @@ mod gizmo;
 mod panels;
 mod pick;
 mod scene_texture;
+mod selection;
+
+use selection::Selection;
 
 use egui_dock::DockState;
 use panels::{Panels, Tab};
@@ -54,7 +57,7 @@ pub struct Editor {
     pending_free: Vec<egui::TextureId>,
     free_ready: Vec<egui::TextureId>,
     viewport_rect: Option<egui::Rect>,
-    selection: Option<scene::Entity>,
+    selection: Selection,
     gizmo: gizmo::ObjectGizmo,
     scene: Option<scene_texture::SceneTexture>,
     pixels_per_point: f32,
@@ -126,7 +129,7 @@ impl Editor {
             pending_free: Vec::new(),
             free_ready: Vec::new(),
             viewport_rect: None,
-            selection: None,
+            selection: Selection::default(),
             gizmo: gizmo::ObjectGizmo::default(),
             scene: None,
             pixels_per_point: window.scale_factor() as f32,
@@ -151,7 +154,7 @@ impl Editor {
 
     pub fn begin_frame(&mut self, window: &Window, view: FrameView<'_>) -> Vec<FileAction> {
         let mut dock = self.dock.take().unwrap_or_else(panels::dock_state);
-        let mut selection = self.selection.take();
+        let mut selection = std::mem::take(&mut self.selection);
         let mut gizmo = std::mem::take(&mut self.gizmo);
         let mut viewport_rect = None;
         let mut viewport_px = self.viewport_pixels().unwrap_or([0, 0]);
@@ -196,9 +199,7 @@ impl Editor {
                 });
         });
         self.dock = Some(dock);
-        if selection.is_some_and(|entity| view.scene.local(entity).is_err()) {
-            selection = None;
-        }
+        selection.retain_valid(view.scene);
         self.selection = selection;
         self.gizmo = gizmo;
         self.viewport_rect = viewport_rect;
@@ -223,7 +224,7 @@ impl Editor {
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        self.selection.clear();
     }
 
     /// Uploads `set` now and frees the previous frame's ids. This frame's frees wait until the

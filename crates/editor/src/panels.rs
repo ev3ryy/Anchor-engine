@@ -2,6 +2,7 @@ use egui_dock::{DockState, NodeIndex, TabViewer};
 use render::Camera;
 
 use crate::physical_pixels;
+use crate::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
@@ -16,7 +17,7 @@ pub(crate) struct Panels<'a> {
     pub viewport_px: &'a mut [u32; 2],
     pub scene: Option<egui::TextureId>,
     pub world: &'a mut scene::Scene,
-    pub selection: &'a mut Option<scene::Entity>,
+    pub selection: &'a mut Selection,
     pub gizmo: &'a mut crate::gizmo::ObjectGizmo,
     pub default_material: scene::AssetId,
     pub camera: &'a Camera,
@@ -28,8 +29,8 @@ pub(crate) struct Panels<'a> {
 enum HierarchyAction {
     CreateRoot,
     CreateChild(scene::Entity),
-    Delete(scene::Entity),
-    Duplicate(scene::Entity),
+    Delete,
+    Duplicate,
 }
 
 pub(crate) fn dock_state() -> DockState<Tab> {
@@ -82,17 +83,21 @@ impl TabViewer for Panels<'_> {
                         input.pointer.latest_pos(),
                     )
                 });
-                let claims =
-                    self.gizmo
-                        .claims_pointer(ui, rect, self.camera, self.world, self.selection);
+                let mut primary = self.selection.primary();
+                let claims = self
+                    .gizmo
+                    .claims_pointer(ui, rect, self.camera, self.world, &primary);
                 if pressed
                     && let Some(pos) = pos.filter(|pos| rect.contains(*pos))
                     && !claims
                 {
-                    *self.selection = crate::pick::pick(self.camera, rect, pos, self.world);
+                    match crate::pick::pick(self.camera, rect, pos, self.world) {
+                        Some(entity) => self.selection.select_only(entity),
+                        None => self.selection.clear(),
+                    }
+                    primary = self.selection.primary();
                 }
-                self.gizmo
-                    .show(ui, rect, self.camera, self.world, self.selection);
+                self.gizmo.show(ui, rect, self.camera, self.world, &primary);
             }
             Tab::Inspector => {
                 inspector(ui, self.world, self.selection, self.default_material);
@@ -145,24 +150,22 @@ impl TabViewer for Panels<'_> {
 fn hierarchy_panel(
     ui: &mut egui::Ui,
     world: &scene::Scene,
-    selection: &mut Option<scene::Entity>,
+    selection: &mut Selection,
 ) -> Option<HierarchyAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         if ui.button("Create").clicked() {
             action = Some(HierarchyAction::CreateRoot);
         }
-        let child = ui.add_enabled(selection.is_some(), egui::Button::new("Child"));
+        let child = ui.add_enabled(selection.len() == 1, egui::Button::new("Child"));
         if child.clicked()
-            && let Some(parent) = *selection
+            && let Some(parent) = selection.primary()
         {
             action = Some(HierarchyAction::CreateChild(parent));
         }
-        let delete = ui.add_enabled(selection.is_some(), egui::Button::new("Delete"));
-        if delete.clicked()
-            && let Some(entity) = *selection
-        {
-            action = Some(HierarchyAction::Delete(entity));
+        let delete = ui.add_enabled(!selection.is_empty(), egui::Button::new("Delete"));
+        if delete.clicked() && !selection.is_empty() {
+            action = Some(HierarchyAction::Delete);
         }
     });
     if world.is_empty() {
@@ -174,19 +177,13 @@ fn hierarchy_panel(
         hierarchy_node(ui, world, selection, &mut action, root, 0);
     }
     if action.is_none() {
-        action = hierarchy_shortcut(ui, *selection);
+        action = hierarchy_shortcut(ui, selection);
     }
     action
 }
 
-fn hierarchy_shortcut(
-    ui: &mut egui::Ui,
-    selection: Option<scene::Entity>,
-) -> Option<HierarchyAction> {
-    let Some(entity) = selection else {
-        return None;
-    };
-    if ui.ctx().text_edit_focused() {
+fn hierarchy_shortcut(ui: &mut egui::Ui, selection: &Selection) -> Option<HierarchyAction> {
+    if selection.is_empty() || ui.ctx().text_edit_focused() {
         return None;
     }
     ui.input_mut(|input| {
@@ -194,13 +191,13 @@ fn hierarchy_shortcut(
             egui::Modifiers::NONE,
             egui::Key::Delete,
         )) {
-            return Some(HierarchyAction::Delete(entity));
+            return Some(HierarchyAction::Delete);
         }
         if input.consume_shortcut(&egui::KeyboardShortcut::new(
             egui::Modifiers::CTRL,
             egui::Key::D,
         )) {
-            return Some(HierarchyAction::Duplicate(entity));
+            return Some(HierarchyAction::Duplicate);
         }
         None
     })
@@ -209,7 +206,7 @@ fn hierarchy_shortcut(
 fn hierarchy_node(
     ui: &mut egui::Ui,
     world: &scene::Scene,
-    selection: &mut Option<scene::Entity>,
+    selection: &mut Selection,
     action: &mut Option<HierarchyAction>,
     entity: scene::Entity,
     depth: usize,
@@ -223,9 +220,12 @@ fn hierarchy_node(
                 .flatten()
                 .map(scene::Name::as_str)
                 .unwrap_or("Entity");
-            let response = ui.selectable_label(*selection == Some(entity), label);
+            let response = ui.selectable_label(selection.contains(entity), label);
             if response.clicked() {
-                *selection = Some(entity);
+                hierarchy_click(ui, world, selection, entity);
+            }
+            if response.secondary_clicked() && !selection.contains(entity) {
+                selection.select_only(entity);
             }
             response.context_menu(|ui| {
                 if ui.button("Child").clicked() {
@@ -233,7 +233,7 @@ fn hierarchy_node(
                     ui.close();
                 }
                 if ui.button("Delete").clicked() {
-                    *action = Some(HierarchyAction::Delete(entity));
+                    *action = Some(HierarchyAction::Delete);
                     ui.close();
                 }
             });
@@ -248,9 +248,45 @@ fn hierarchy_node(
     }
 }
 
+fn hierarchy_click(
+    ui: &egui::Ui,
+    world: &scene::Scene,
+    selection: &mut Selection,
+    entity: scene::Entity,
+) {
+    let modifiers = ui.input(|input| input.modifiers);
+    if modifiers.shift {
+        let order = hierarchy_order(world);
+        selection.select_range(&order, entity, modifiers.command);
+    } else if modifiers.command {
+        selection.toggle(entity);
+    } else {
+        selection.select_only(entity);
+    }
+}
+
+fn hierarchy_order(world: &scene::Scene) -> Vec<scene::Entity> {
+    let mut order = Vec::new();
+    for root in world.roots() {
+        push_order(world, root, &mut order);
+    }
+    order
+}
+
+fn push_order(world: &scene::Scene, entity: scene::Entity, order: &mut Vec<scene::Entity>) {
+    order.push(entity);
+    let children: Vec<_> = world
+        .children(entity)
+        .map(|children| children.collect())
+        .unwrap_or_default();
+    for child in children {
+        push_order(world, child, order);
+    }
+}
+
 fn apply_hierarchy(
     world: &mut scene::Scene,
-    selection: &mut Option<scene::Entity>,
+    selection: &mut Selection,
     action: Option<HierarchyAction>,
 ) {
     let Some(action) = action else {
@@ -260,27 +296,57 @@ fn apply_hierarchy(
         HierarchyAction::CreateRoot => {
             let entity = world.spawn();
             let _ = world.insert(entity, scene::Name::new("Entity"));
-            *selection = Some(entity);
+            selection.select_only(entity);
         }
         HierarchyAction::CreateChild(parent) => {
             if let Ok(entity) = world.spawn_child(parent) {
                 let _ = world.insert(entity, scene::Name::new("Entity"));
-                *selection = Some(entity);
+                selection.select_only(entity);
             }
         }
-        HierarchyAction::Delete(entity) => {
-            if let Ok(destroyed) = world.despawn(entity)
-                && selection.is_some_and(|selected| destroyed.contains(&selected))
-            {
-                *selection = None;
+        HierarchyAction::Delete => {
+            let targets: Vec<_> = selection.entities().to_vec();
+            for entity in targets {
+                let _ = world.despawn(entity);
             }
+            selection.clear();
         }
-        HierarchyAction::Duplicate(entity) => {
-            if let Some(copy) = duplicate(world, entity) {
-                *selection = Some(copy);
+        HierarchyAction::Duplicate => {
+            let targets = topmost(world, selection.entities());
+            let mut copies = Vec::new();
+            for entity in targets {
+                if let Some(copy) = duplicate(world, entity) {
+                    copies.push(copy);
+                }
+            }
+            if !copies.is_empty() {
+                selection.set(copies);
             }
         }
     }
+}
+
+fn topmost(world: &scene::Scene, entities: &[scene::Entity]) -> Vec<scene::Entity> {
+    entities
+        .iter()
+        .copied()
+        .filter(|entity| !ancestor_selected(world, *entity, entities))
+        .collect()
+}
+
+fn ancestor_selected(
+    world: &scene::Scene,
+    entity: scene::Entity,
+    selected: &[scene::Entity],
+) -> bool {
+    let mut parent = world.parent(entity).ok().flatten();
+    while let Some(current) = parent {
+        if selected.contains(&current) {
+            return true;
+        }
+        parent = world.parent(current).ok().flatten();
+    }
+    false
 }
 
 fn duplicate(world: &mut scene::Scene, entity: scene::Entity) -> Option<scene::Entity> {
@@ -360,16 +426,19 @@ fn copy_components(world: &mut scene::Scene, from: scene::Entity, to: scene::Ent
 fn inspector(
     ui: &mut egui::Ui,
     world: &mut scene::Scene,
-    selection: &Option<scene::Entity>,
+    selection: &Selection,
     default_material: scene::AssetId,
 ) {
-    let Some(entity) = *selection else {
+    let Some(entity) = selection.primary() else {
         ui.label("No selection");
         return;
     };
     if world.local(entity).is_err() {
         ui.label("No selection");
         return;
+    }
+    if selection.len() > 1 {
+        ui.label(format!("{} selected", selection.len()));
     }
     ui.label("Transform");
     edit_transform(ui, world, entity);

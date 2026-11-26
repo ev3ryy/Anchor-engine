@@ -52,6 +52,41 @@ impl ObjectGizmo {
         self.toolbar(ui, toolbar);
     }
 
+    pub(crate) fn claims_pointer(
+        &mut self,
+        ui: &egui::Ui,
+        viewport: egui::Rect,
+        camera: &render::Camera,
+        world: &mut scene::Scene,
+        selection: &Option<scene::Entity>,
+    ) -> bool {
+        let Some(entity) = *selection else {
+            return false;
+        };
+        let pointer = pointer_state(ui);
+        let Some(pos) = pointer.pos else {
+            return self.dragging;
+        };
+        if self.dragging || toolbar_rect(viewport).contains(pos) {
+            return true;
+        }
+        if self.target != Some(entity) || viewport.width() < 1.0 || viewport.height() < 1.0 {
+            return false;
+        }
+        world.update();
+        let Ok(world_matrix) = world.world(entity) else {
+            return false;
+        };
+        self.aim(
+            ui,
+            viewport,
+            camera,
+            &pointer,
+            gizmo_transform(world_matrix),
+        );
+        viewport.contains(pos) && self.inner.pick_preview((pos.x, pos.y))
+    }
+
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
         if ui.ctx().text_edit_focused() {
             return;
@@ -83,7 +118,8 @@ impl ObjectGizmo {
         world: &mut scene::Scene,
         entity: scene::Entity,
     ) {
-        if self.target != Some(entity) {
+        let switched = self.target != Some(entity);
+        if switched {
             self.inner = Gizmo::default();
             self.dragging = false;
             self.target = Some(entity);
@@ -93,34 +129,17 @@ impl ObjectGizmo {
             return;
         };
         let target = gizmo_transform(world_matrix);
-        let pointer = ui.input(|input| Pointer {
-            pos: input.pointer.latest_pos(),
-            primary: input.pointer.button_down(egui::PointerButton::Primary),
-            pressed: input.pointer.button_pressed(egui::PointerButton::Primary),
-            snap: input.modifiers.ctrl || input.modifiers.command,
-        });
+        let pointer = pointer_state(ui);
         if !pointer.primary {
             self.dragging = false;
         }
-        self.inner.update_config(GizmoConfig {
-            view_matrix: row_matrix(camera.view()),
-            projection_matrix: row_matrix(camera.projection(viewport.aspect_ratio())),
-            viewport,
-            modes: modes(self.kind),
-            orientation: self.orientation,
-            snapping: pointer.snap,
-            pixels_per_point: ui.pixels_per_point(),
-            ..*self.inner.config()
-        });
-        let cursor = pointer.pos.unwrap_or(viewport.center());
-        if !self.dragging {
-            let _ = self.inner.update(idle(cursor), &[target]);
-        }
-        let over = pointer.pos.is_some_and(|pos| {
-            viewport.contains(pos)
-                && !toolbar.contains(pos)
-                && self.inner.pick_preview((pos.x, pos.y))
-        });
+        let cursor = self.aim(ui, viewport, camera, &pointer, target);
+        let over = !switched
+            && pointer.pos.is_some_and(|pos| {
+                viewport.contains(pos)
+                    && !toolbar.contains(pos)
+                    && self.inner.pick_preview((pos.x, pos.y))
+            });
         let result = self.inner.update(
             GizmoInteraction {
                 cursor_pos: (cursor.x, cursor.y),
@@ -174,6 +193,15 @@ struct Pointer {
     snap: bool,
 }
 
+fn pointer_state(ui: &egui::Ui) -> Pointer {
+    ui.input(|input| Pointer {
+        pos: input.pointer.latest_pos(),
+        primary: input.pointer.button_down(egui::PointerButton::Primary),
+        pressed: input.pointer.button_pressed(egui::PointerButton::Primary),
+        snap: input.modifiers.ctrl || input.modifiers.command,
+    })
+}
+
 fn kind_button(ui: &mut egui::Ui, kind: &mut Kind, next: Kind, label: &str) {
     if ui.selectable_label(*kind == next, label).clicked() {
         *kind = next;
@@ -196,6 +224,33 @@ fn modes(kind: Kind) -> transform_gizmo_egui::EnumSet<GizmoMode> {
         Kind::Translate => GizmoMode::all_translate(),
         Kind::Rotate => GizmoMode::all_rotate(),
         Kind::Scale => GizmoMode::all_scale(),
+    }
+}
+
+impl ObjectGizmo {
+    fn aim(
+        &mut self,
+        ui: &egui::Ui,
+        viewport: egui::Rect,
+        camera: &render::Camera,
+        pointer: &Pointer,
+        target: Transform,
+    ) -> egui::Pos2 {
+        self.inner.update_config(GizmoConfig {
+            view_matrix: row_matrix(camera.view()),
+            projection_matrix: row_matrix(camera.projection(viewport.aspect_ratio())),
+            viewport,
+            modes: modes(self.kind),
+            orientation: self.orientation,
+            snapping: pointer.snap,
+            pixels_per_point: ui.pixels_per_point(),
+            ..*self.inner.config()
+        });
+        let cursor = pointer.pos.unwrap_or(viewport.center());
+        if !self.dragging {
+            let _ = self.inner.update(idle(cursor), &[target]);
+        }
+        cursor
     }
 }
 

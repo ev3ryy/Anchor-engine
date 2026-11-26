@@ -75,6 +75,21 @@ impl TabViewer for Panels<'_> {
                         egui::Color32::WHITE,
                     );
                 }
+                let (pressed, pos) = ui.input(|input| {
+                    (
+                        input.pointer.button_pressed(egui::PointerButton::Primary),
+                        input.pointer.latest_pos(),
+                    )
+                });
+                let claims =
+                    self.gizmo
+                        .claims_pointer(ui, rect, self.camera, self.world, self.selection);
+                if pressed
+                    && let Some(pos) = pos.filter(|pos| rect.contains(*pos))
+                    && !claims
+                {
+                    *self.selection = crate::pick::pick(self.camera, rect, pos, self.world);
+                }
                 self.gizmo
                     .show(ui, rect, self.camera, self.world, self.selection);
             }

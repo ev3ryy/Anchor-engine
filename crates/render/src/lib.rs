@@ -8,7 +8,7 @@ mod instance;
 mod instances;
 mod material;
 mod pipeline;
-mod primitive;
+pub mod primitive;
 mod queue;
 mod shader;
 mod surface;

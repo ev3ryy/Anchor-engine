@@ -1,5 +1,6 @@
 mod gizmo;
 mod panels;
+mod pick;
 mod scene_texture;
 
 use egui_dock::DockState;

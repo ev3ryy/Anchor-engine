@@ -1,6 +1,6 @@
-use scene::{AssetId, Camera, Light, Mesh, MeshRenderer, Name, Scene};
+use scene::{AssetId, Camera, Light, MeshRenderer, Model, Name, Scene};
 
-use crate::document::{CameraValue, Document, LightValue, MeshValue, Node};
+use crate::document::{CameraValue, Document, LightValue, MeshValue, Node, PrimitiveValue};
 use crate::resolve::{self, from_transform};
 use crate::{Assets, Error};
 
@@ -29,13 +29,13 @@ pub fn document_to_scene(document: &Document, assets: &Assets) -> Result<Scene, 
                 .insert(entity, Name::new(name.clone()))
                 .expect("fresh entity");
         }
-        if let Some(material) = node.mesh {
+        if let Some(mesh) = node.mesh {
             scene
                 .insert(
                     entity,
                     MeshRenderer {
-                        mesh: Mesh::Cube,
-                        material,
+                        model: Model::Primitive(mesh.primitive),
+                        material: mesh.material,
                     },
                 )
                 .expect("fresh entity");
@@ -77,10 +77,14 @@ pub fn scene_to_document(scene: &Scene, guid: &str, assets: &Assets) -> Result<D
         let mesh = scene
             .get::<MeshRenderer>(entity)
             .expect("live entity")
-            .map(|mesh| MeshValue {
-                material: assets
-                    .path(mesh.material)
-                    .unwrap_or_else(|| mesh.material.canonical()),
+            .map(|mesh| {
+                let Model::Primitive(primitive) = mesh.model;
+                MeshValue {
+                    primitive: PrimitiveValue::from_primitive(primitive),
+                    material: assets
+                        .path(mesh.material)
+                        .unwrap_or_else(|| mesh.material.canonical()),
+                }
             });
         let camera = scene
             .get::<Camera>(entity)

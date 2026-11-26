@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use scene::Primitive;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub guid: String,
@@ -41,8 +43,53 @@ impl Default for TransformValue {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveValue {
+    #[default]
+    Cube,
+    Sphere,
+    Cylinder,
+    Capsule,
+    Plane,
+    Cone,
+    Wedge,
+}
+
+impl PrimitiveValue {
+    pub fn to_primitive(self) -> Primitive {
+        match self {
+            Self::Cube => Primitive::Cube,
+            Self::Sphere => Primitive::Sphere,
+            Self::Cylinder => Primitive::Cylinder,
+            Self::Capsule => Primitive::Capsule,
+            Self::Plane => Primitive::Plane,
+            Self::Cone => Primitive::Cone,
+            Self::Wedge => Primitive::Wedge,
+        }
+    }
+
+    pub fn from_primitive(primitive: Primitive) -> Self {
+        match primitive {
+            Primitive::Cube => Self::Cube,
+            Primitive::Sphere => Self::Sphere,
+            Primitive::Cylinder => Self::Cylinder,
+            Primitive::Capsule => Self::Capsule,
+            Primitive::Plane => Self::Plane,
+            Primitive::Cone => Self::Cone,
+            Primitive::Wedge => Self::Wedge,
+        }
+    }
+}
+
+fn is_cube(primitive: &PrimitiveValue) -> bool {
+    *primitive == PrimitiveValue::Cube
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshValue {
+    #[serde(default, skip_serializing_if = "is_cube")]
+    pub primitive: PrimitiveValue,
     pub material: String,
 }
 

@@ -8,6 +8,7 @@ mod instance;
 mod instances;
 mod material;
 mod pipeline;
+mod primitive;
 mod queue;
 mod shader;
 mod surface;
@@ -160,7 +161,7 @@ pub struct Overlay<'a> {
 }
 
 pub struct Context {
-    // Drop order: shaders, bindless, sync, commands, swapchain, viewport, retired viewports, depth, device, surface, instance.
+    // Drop order: shaders, bindless, sync, commands, swapchain, viewport, retired viewports, depth, primitive cache, device, surface, instance.
     // The window must outlive this context. ShaderSet drops while the device is still alive,
     // and before the shared bindless pipeline layout.
     shaders: shader::ShaderSet,
@@ -171,6 +172,7 @@ pub struct Context {
     viewport: Option<viewport::ViewportTarget>,
     retired_viewports: Vec<viewport::ViewportTarget>,
     depth: Option<depth::DepthBuffer>,
+    primitives: primitive::Cache,
     draw_order: Vec<usize>,
     draw_batches: Vec<instances::Batch>,
     device: device::DeviceBundle,
@@ -224,6 +226,8 @@ impl Context {
             return Err(err);
         }
         let _white = bindless.finish_upload()?;
+        let primitives =
+            primitive::Cache::create(&instance.instance, device.physical_device, &device.device)?;
         let shaders = shader::ShaderSet::new(
             &instance.instance,
             device.physical_device,
@@ -241,6 +245,7 @@ impl Context {
             viewport: None,
             retired_viewports: Vec::new(),
             depth: None,
+            primitives,
             draw_order: Vec::new(),
             draw_batches: Vec::new(),
             device,
@@ -378,6 +383,7 @@ impl Context {
         if draws_scene {
             let mut order = std::mem::take(&mut self.draw_order);
             let mut batches = std::mem::take(&mut self.draw_batches);
+            let index_counts = self.primitives.index_counts();
             let planned = instances::plan_draws(
                 draws,
                 |material| {
@@ -388,6 +394,7 @@ impl Context {
                         })
                         .ok()
                 },
+                |model| index_counts[primitive::slot(model) as usize],
                 &mut order,
                 &mut batches,
             );
@@ -448,6 +455,7 @@ impl Context {
             pad2: 0,
         };
         let batches = std::mem::take(&mut self.draw_batches);
+        let meshes = self.primitives.draw_meshes();
         let descriptor_set = self.bindless.descriptor_set();
         let material_buffers = self.bindless.material_buffers();
         let image_available = self.sync.image_available;
@@ -469,6 +477,7 @@ impl Context {
                 drawn,
                 descriptor_set,
                 &batches,
+                &meshes,
                 &mut frame,
                 overlay,
             )
@@ -629,6 +638,40 @@ fn create_depth(
     depth::create(instance, physical_device, device, extent, format).map(Some)
 }
 
+fn record_geometry_visibility(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    meshes: &[primitive::DrawMesh],
+) {
+    if meshes.is_empty() {
+        return;
+    }
+    let mut buffers = Vec::with_capacity(meshes.len() * 2);
+    for mesh in meshes {
+        buffers.push(mesh.vertex);
+        buffers.push(mesh.index);
+    }
+    let barriers: Vec<_> = buffers
+        .iter()
+        .map(|buffer| {
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::HOST)
+                .src_access_mask(vk::AccessFlags2::HOST_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+                .dst_access_mask(
+                    vk::AccessFlags2::VERTEX_ATTRIBUTE_READ | vk::AccessFlags2::INDEX_READ,
+                )
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(*buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)
+        })
+        .collect();
+    let dependency = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
+}
+
 fn record_material_visibility(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -664,6 +707,7 @@ fn record_frame(
     drawn: Option<shader::DrawBinding>,
     descriptor_set: vk::DescriptorSet,
     batches: &[instances::Batch],
+    meshes: &[primitive::DrawMesh],
     frame: &mut material::FramePush,
     overlay: impl FnOnce(Overlay<'_>) -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -708,6 +752,7 @@ fn record_frame(
             drawn,
             descriptor_set,
             batches,
+            meshes,
             frame,
         )?;
         if scene.offscreen {
@@ -787,6 +832,7 @@ fn record_scene(
     drawn: shader::DrawBinding,
     descriptor_set: vk::DescriptorSet,
     batches: &[instances::Batch],
+    meshes: &[primitive::DrawMesh],
     frame: &mut material::FramePush,
 ) -> Result<(), Error> {
     if drawn.push_size as usize != std::mem::size_of::<material::FramePush>() {
@@ -831,6 +877,7 @@ fn record_scene(
         .layer_count(1)
         .color_attachments(std::slice::from_ref(&attachment))
         .depth_attachment(&depth_attachment);
+    record_geometry_visibility(device, command_buffer, meshes);
     unsafe {
         device.cmd_begin_rendering(command_buffer, &rendering);
         device.cmd_bind_pipeline(
@@ -874,10 +921,13 @@ fn record_scene(
             }],
         );
         for batch in batches {
+            let mesh = meshes[batch.slot as usize];
             frame.material_index = batch.material_index;
             frame.instance_base = batch.begin;
             let tail =
                 std::slice::from_raw_parts((&frame.material_index as *const u32).cast::<u8>(), 8);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex], &[0]);
+            device.cmd_bind_index_buffer(command_buffer, mesh.index, 0, vk::IndexType::UINT32);
             device.cmd_push_constants(
                 command_buffer,
                 drawn.layout,
@@ -885,7 +935,7 @@ fn record_scene(
                 drawn.push_offset + 64,
                 tail,
             );
-            device.cmd_draw(command_buffer, batch.vertices, batch.count, 0, 0);
+            device.cmd_draw_indexed(command_buffer, batch.index_count, batch.count, 0, 0, 0);
         }
         device.cmd_end_rendering(command_buffer);
     }

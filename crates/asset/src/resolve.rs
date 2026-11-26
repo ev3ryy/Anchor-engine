@@ -1,16 +1,22 @@
 use std::collections::HashMap;
 
-use scene::{AssetId, Camera, Light, Quat, Transform, Vec3};
+use scene::{AssetId, Camera, Light, Primitive, Quat, Transform, Vec3};
 
 use crate::document::{Document, Node, Override, TransformValue};
 use crate::{Assets, Error};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedMesh {
+    pub primitive: Primitive,
+    pub material: AssetId,
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolvedNode {
     pub parent: Option<u32>,
     pub name: Option<String>,
     pub transform: Transform,
-    pub mesh: Option<AssetId>,
+    pub mesh: Option<ResolvedMesh>,
     pub camera: Option<Camera>,
     pub light: Option<Light>,
 }
@@ -34,7 +40,14 @@ pub fn resolve(
             transform: to_transform(node.id, &node.transform)?,
             mesh: node
                 .mesh
-                .map(|mesh| assets.material(&mesh.material))
+                .map(|mesh| {
+                    assets
+                        .material(&mesh.material)
+                        .map(|material| ResolvedMesh {
+                            primitive: mesh.primitive.to_primitive(),
+                            material,
+                        })
+                })
                 .transpose()?,
             camera: node.camera.map(|camera| Camera {
                 fov_y: camera.fov_y,

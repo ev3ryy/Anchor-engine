@@ -533,7 +533,7 @@ fn attach_child_mesh(scene: &mut scene::Scene, material: scene::AssetId) {
                 .insert(
                     child,
                     scene::MeshRenderer {
-                        mesh: scene::Mesh::Cube,
+                        model: scene::Model::Primitive(scene::Primitive::Cube),
                         material,
                     },
                 )

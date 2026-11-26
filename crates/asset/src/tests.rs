@@ -1,10 +1,10 @@
 use std::io::Write;
 
 use scene::cooked::CookedScene;
-use scene::{AssetId, Camera, Light, Mesh, MeshRenderer, Name, Quat, Scene, Vec3};
+use scene::{AssetId, Camera, Light, MeshRenderer, Model, Name, Primitive, Quat, Scene, Vec3};
 
 use crate::cook;
-use crate::document::{MeshValue, Node, Override, PrefabInstance, TransformValue};
+use crate::document::{MeshValue, Node, Override, PrefabInstance, PrimitiveValue, TransformValue};
 use crate::pak::Pak;
 use crate::{
     Assets, Document, Entry, Error, Kind, document_to_scene, format_document, parse_document,
@@ -71,7 +71,7 @@ fn document_scene_roundtrip_keeps_material() {
         .insert(
             child,
             MeshRenderer {
-                mesh: Mesh::Cube,
+                model: Model::Primitive(Primitive::Cube),
                 material: material(),
             },
         )
@@ -107,6 +107,51 @@ fn document_scene_roundtrip_keeps_material() {
 }
 
 #[test]
+fn omitted_primitive_is_a_cube_and_named_primitives_roundtrip() {
+    let omitted: MeshValue = ron::from_str("(material: \"mat\")").unwrap();
+    assert_eq!(omitted.primitive, PrimitiveValue::Cube);
+    let named: MeshValue = ron::from_str("(primitive: wedge, material: \"mat\")").unwrap();
+    assert_eq!(named.primitive, PrimitiveValue::Wedge);
+
+    let mut scene = Scene::new();
+    let sphere = scene.spawn();
+    scene.insert(sphere, Name::new("Sphere")).unwrap();
+    scene
+        .insert(
+            sphere,
+            MeshRenderer {
+                model: Model::Primitive(Primitive::Sphere),
+                material: material(),
+            },
+        )
+        .unwrap();
+    let wedge = scene.spawn_child(sphere).unwrap();
+    scene.insert(wedge, Name::new("Wedge")).unwrap();
+    scene
+        .insert(
+            wedge,
+            MeshRenderer {
+                model: Model::Primitive(Primitive::Wedge),
+                material: material(),
+            },
+        )
+        .unwrap();
+    scene.update();
+    let assets = assets_with_material();
+    let document = scene_to_document(&scene, SCENE_GUID, &assets).unwrap();
+    let text = format_document(&document).unwrap();
+    assert!(text.contains("sphere"));
+    assert!(text.contains("wedge"));
+    let loaded = document_to_scene(&parse_document(&text).unwrap(), &assets).unwrap();
+    assert_same(&scene, &loaded);
+    let cooked = cook::cook(&document, &assets, Some("shapes.scene")).unwrap();
+    let instantiated = CookedScene::validate(cooked.as_slice())
+        .unwrap()
+        .instantiate();
+    assert_same(&scene, &instantiated);
+}
+
+#[test]
 fn missing_path_roundtrips_as_guid() {
     let mut scene = Scene::new();
     let root = scene.spawn();
@@ -114,7 +159,7 @@ fn missing_path_roundtrips_as_guid() {
         .insert(
             root,
             MeshRenderer {
-                mesh: Mesh::Cube,
+                model: Model::Primitive(Primitive::Cube),
                 material: material(),
             },
         )
@@ -149,6 +194,7 @@ fn prefab_override_replaces_nested_translation() {
                 nodes: vec![
                     Node {
                         mesh: Some(MeshValue {
+                            primitive: PrimitiveValue::Cube,
                             material: "materials/checker.mat".to_string(),
                         }),
                         ..plain(1, None, "Crate", [0.0, 0.0, 0.0])
@@ -231,6 +277,7 @@ fn prefab_cycle_and_unknown_material_fail() {
         guid: SCENE_GUID.to_string(),
         nodes: vec![Node {
             mesh: Some(MeshValue {
+                primitive: PrimitiveValue::Cube,
                 material: "missing.mat".to_string(),
             }),
             ..plain(1, None, "Root", [0.0, 0.0, 0.0])
@@ -251,6 +298,7 @@ fn cook_is_stable_and_matches_scene_worlds() {
             plain(1, None, "Root", [0.0, 2.0, 0.0]),
             Node {
                 mesh: Some(MeshValue {
+                    primitive: PrimitiveValue::Cube,
                     material: "materials/checker.mat".to_string(),
                 }),
                 ..plain(2, Some(1), "Child", [1.0, 0.0, 0.0])
@@ -467,13 +515,8 @@ fn assert_same(left: &Scene, right: &Scene) {
             right.get::<Name>(b).unwrap().map(Name::as_str)
         );
         assert_eq!(
-            left.get::<MeshRenderer>(a)
-                .unwrap()
-                .map(|mesh| mesh.material),
-            right
-                .get::<MeshRenderer>(b)
-                .unwrap()
-                .map(|mesh| mesh.material)
+            left.get::<MeshRenderer>(a).unwrap().copied(),
+            right.get::<MeshRenderer>(b).unwrap().copied()
         );
         assert_eq!(
             left.get::<Camera>(a).unwrap().copied(),

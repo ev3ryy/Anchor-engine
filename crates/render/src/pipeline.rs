@@ -10,6 +10,48 @@ pub struct Modules {
     pub fragment: vk::ShaderModule,
 }
 
+#[derive(Clone, Copy)]
+pub struct VertexAttribute {
+    pub location: u32,
+    pub format: vk::Format,
+    pub offset: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct VertexLayout {
+    pub stride: u32,
+    pub attributes: &'static [VertexAttribute],
+}
+
+pub const MESH_VERTEX: VertexLayout = VertexLayout {
+    stride: 32,
+    attributes: &[
+        VertexAttribute {
+            location: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: 0,
+        },
+        VertexAttribute {
+            location: 1,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: 12,
+        },
+        VertexAttribute {
+            location: 2,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: 24,
+        },
+    ],
+};
+
+pub fn mesh_vertex_layout(name: &str) -> Option<VertexLayout> {
+    if name == "triangle" {
+        Some(MESH_VERTEX)
+    } else {
+        None
+    }
+}
+
 pub fn create_modules(device: &Device, vertex: &[u32], fragment: &[u32]) -> Result<Modules, Error> {
     let vertex_info = vk::ShaderModuleCreateInfo::default().code(vertex);
     let vertex = unsafe { device.create_shader_module(&vertex_info, None)? };
@@ -24,6 +66,35 @@ pub fn create_modules(device: &Device, vertex: &[u32], fragment: &[u32]) -> Resu
     Ok(Modules { vertex, fragment })
 }
 
+fn vertex_input(
+    layout: Option<&VertexLayout>,
+) -> (
+    Vec<vk::VertexInputBindingDescription>,
+    Vec<vk::VertexInputAttributeDescription>,
+) {
+    let Some(layout) = layout else {
+        return (Vec::new(), Vec::new());
+    };
+    let bindings = vec![
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(layout.stride)
+            .input_rate(vk::VertexInputRate::VERTEX),
+    ];
+    let attributes = layout
+        .attributes
+        .iter()
+        .map(|attribute| {
+            vk::VertexInputAttributeDescription::default()
+                .location(attribute.location)
+                .binding(0)
+                .format(attribute.format)
+                .offset(attribute.offset)
+        })
+        .collect();
+    (bindings, attributes)
+}
+
 pub fn destroy_module(device: &Device, module: vk::ShaderModule) {
     unsafe { device.destroy_shader_module(module, None) };
 }
@@ -36,6 +107,7 @@ pub fn create_graphics(
     fragment_entry: &CStr,
     layout: vk::PipelineLayout,
     state: &GraphicsState,
+    vertex_layout: Option<&VertexLayout>,
     color_format: vk::Format,
     depth_format: vk::Format,
     spec: &[(u32, u32)],
@@ -73,7 +145,10 @@ pub fn create_graphics(
     }
     let stages = [vertex_stage, fragment_stage];
 
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let (bindings, attributes) = vertex_input(vertex_layout);
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&bindings)
+        .vertex_attribute_descriptions(&attributes);
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(state.topology)
         .primitive_restart_enable(false);

@@ -1,5 +1,5 @@
 use crate::Error;
-use scene::Draw;
+use scene::{Draw, Model};
 
 pub(crate) const CAPACITY: usize = 256;
 
@@ -8,12 +8,14 @@ pub(crate) struct Batch {
     pub material_index: u32,
     pub begin: u32,
     pub count: u32,
-    pub vertices: u32,
+    pub slot: u32,
+    pub index_count: u32,
 }
 
 pub(crate) fn plan_draws(
     draws: &[Draw],
     mut resolve: impl FnMut(scene::MaterialRef) -> Option<u32>,
+    mut index_count: impl FnMut(Model) -> u32,
     order: &mut Vec<usize>,
     batches: &mut Vec<Batch>,
 ) -> Result<(), Error> {
@@ -30,21 +32,21 @@ pub(crate) fn plan_draws(
     }
     order.sort_by(|&left, &right| {
         draws[left]
-            .mesh
-            .cmp(&draws[right].mesh)
+            .model
+            .cmp(&draws[right].model)
             .then(draws[left].material.cmp(&draws[right].material))
     });
     let mut cursor = 0;
     while cursor < order.len() {
         let draw = &draws[order[cursor]];
         let material_index = resolve(draw.material).expect("live material");
-        let mesh = draw.mesh;
+        let model = draw.model;
         let material = draw.material;
         let begin = cursor;
         cursor += 1;
         while cursor < order.len() {
             let next = &draws[order[cursor]];
-            if next.mesh != mesh || next.material != material {
+            if next.model != model || next.material != material {
                 break;
             }
             cursor += 1;
@@ -53,21 +55,20 @@ pub(crate) fn plan_draws(
             material_index,
             begin: begin as u32,
             count: (cursor - begin) as u32,
-            vertices: vertex_count(mesh),
+            slot: crate::primitive::slot(model),
+            index_count: index_count(model),
         });
     }
     Ok(())
 }
 
-pub(crate) fn vertex_count(mesh: scene::Mesh) -> u32 {
-    match mesh {
-        scene::Mesh::Cube => 36,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use scene::{AssetId, Extract, MaterialRef, Mesh, MeshRenderer, Scene, Vec3};
+    use scene::{AssetId, Extract, MaterialRef, MeshRenderer, Model, Primitive, Scene, Vec3};
+
+    fn counts(model: Model) -> u32 {
+        crate::primitive::index_count(model)
+    }
 
     fn asset(index: u32, generation: u32) -> AssetId {
         let mut bytes = [0; 16];
@@ -96,7 +97,7 @@ mod tests {
                 .insert(
                     entity,
                     MeshRenderer {
-                        mesh: Mesh::Cube,
+                        model: Model::Primitive(Primitive::Cube),
                         material: asset(index as u32, generation),
                     },
                 )
@@ -119,6 +120,7 @@ mod tests {
         let error = plan_draws(
             &draws,
             |material| Some(material.index),
+            counts,
             &mut order,
             &mut batches,
         );
@@ -134,6 +136,7 @@ mod tests {
         plan_draws(
             &draws,
             |material| (material.generation != 0).then_some(material.index),
+            counts,
             &mut order,
             &mut batches,
         )
@@ -161,7 +164,7 @@ mod tests {
             .insert(
                 kept,
                 MeshRenderer {
-                    mesh: Mesh::Cube,
+                    model: Model::Primitive(Primitive::Cube),
                     material: asset(live.index, live.generation),
                 },
             )
@@ -170,7 +173,7 @@ mod tests {
             .insert(
                 dropped,
                 MeshRenderer {
-                    mesh: Mesh::Cube,
+                    model: Model::Primitive(Primitive::Cube),
                     material: asset(stale.index, stale.generation),
                 },
             )
@@ -190,6 +193,7 @@ mod tests {
                     })
                     .ok()
             },
+            counts,
             &mut order,
             &mut batches,
         )
@@ -213,7 +217,7 @@ mod tests {
             .insert(
                 later,
                 MeshRenderer {
-                    mesh: Mesh::Cube,
+                    model: Model::Primitive(Primitive::Cube),
                     material: asset(4, 1),
                 },
             )
@@ -222,7 +226,7 @@ mod tests {
             .insert(
                 earlier,
                 MeshRenderer {
-                    mesh: Mesh::Cube,
+                    model: Model::Primitive(Primitive::Cube),
                     material: asset(1, 1),
                 },
             )
@@ -235,6 +239,7 @@ mod tests {
         plan_draws(
             &extract.draws,
             |material| Some(material.index),
+            counts,
             &mut order,
             &mut batches,
         )
@@ -250,5 +255,55 @@ mod tests {
             .collect();
         assert_eq!(worlds[0], scene.world(earlier).unwrap());
         assert_eq!(worlds[1], scene.world(later).unwrap());
+    }
+
+    #[test]
+    fn different_primitives_are_separate_batches() {
+        let mut scene = Scene::new();
+        let cube = scene.spawn();
+        let sphere = scene.spawn();
+        scene
+            .insert(
+                cube,
+                MeshRenderer {
+                    model: Model::Primitive(Primitive::Cube),
+                    material: asset(1, 1),
+                },
+            )
+            .unwrap();
+        scene
+            .insert(
+                sphere,
+                MeshRenderer {
+                    model: Model::Primitive(Primitive::Sphere),
+                    material: asset(1, 1),
+                },
+            )
+            .unwrap();
+        scene.update();
+        let mut extract = Extract::default();
+        scene.extract_into(&mut extract, bind);
+        let mut order = Vec::new();
+        let mut batches = Vec::new();
+        plan_draws(
+            &extract.draws,
+            |material| Some(material.index),
+            counts,
+            &mut order,
+            &mut batches,
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].slot, Primitive::Cube.kind());
+        assert_eq!(batches[1].slot, Primitive::Sphere.kind());
+        assert_eq!(
+            batches[0].index_count,
+            counts(Model::Primitive(Primitive::Cube))
+        );
+        assert_eq!(
+            batches[1].index_count,
+            counts(Model::Primitive(Primitive::Sphere))
+        );
+        assert_ne!(batches[0].index_count, batches[1].index_count);
     }
 }

@@ -348,11 +348,45 @@ fn edit_component(
             else {
                 return;
             };
-            ui.label("Cube");
-            edit_material(ui, world, entity, mesh.material);
+            let mesh = edit_model(ui, world, entity, mesh);
+            edit_material(ui, world, entity, mesh);
         }
         scene::ComponentId::Camera => edit_camera(ui, world, entity),
         scene::ComponentId::Light => edit_light(ui, world, entity),
+    }
+}
+
+fn edit_model(
+    ui: &mut egui::Ui,
+    world: &mut scene::Scene,
+    entity: scene::Entity,
+    mut mesh: scene::MeshRenderer,
+) -> scene::MeshRenderer {
+    let scene::Model::Primitive(current) = mesh.model;
+    let mut selected = current;
+    egui::ComboBox::from_id_salt(("mesh-model", entity))
+        .selected_text(primitive_name(selected))
+        .show_ui(ui, |ui| {
+            for primitive in scene::Primitive::ALL {
+                ui.selectable_value(&mut selected, primitive, primitive_name(primitive));
+            }
+        });
+    if selected != current {
+        mesh.model = scene::Model::Primitive(selected);
+        let _ = world.insert(entity, mesh);
+    }
+    mesh
+}
+
+fn primitive_name(primitive: scene::Primitive) -> &'static str {
+    match primitive {
+        scene::Primitive::Cube => "Cube",
+        scene::Primitive::Sphere => "Sphere",
+        scene::Primitive::Cylinder => "Cylinder",
+        scene::Primitive::Capsule => "Capsule",
+        scene::Primitive::Plane => "Plane",
+        scene::Primitive::Cone => "Cone",
+        scene::Primitive::Wedge => "Wedge",
     }
 }
 
@@ -360,12 +394,12 @@ fn edit_material(
     ui: &mut egui::Ui,
     world: &mut scene::Scene,
     entity: scene::Entity,
-    material: scene::AssetId,
+    mesh: scene::MeshRenderer,
 ) {
     let id = egui::Id::new(("mesh-material", entity));
     let mut text = ui
         .data(|data| data.get_temp::<String>(id))
-        .unwrap_or_else(|| material.canonical());
+        .unwrap_or_else(|| mesh.material.canonical());
     let response = ui.text_edit_singleline(&mut text);
     if response.changed()
         && let Some(material) = scene::AssetId::parse(&text)
@@ -373,7 +407,7 @@ fn edit_material(
         let _ = world.insert(
             entity,
             scene::MeshRenderer {
-                mesh: scene::Mesh::Cube,
+                model: mesh.model,
                 material,
             },
         );
@@ -492,7 +526,7 @@ fn add_component(
             let _ = world.insert(
                 entity,
                 scene::MeshRenderer {
-                    mesh: scene::Mesh::Cube,
+                    model: scene::Model::Primitive(scene::Primitive::Cube),
                     material: default_material,
                 },
             );

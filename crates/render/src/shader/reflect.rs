@@ -272,45 +272,48 @@ mod tests {
         fs::create_dir_all(&temp).expect("temp dir");
         let vertex_path = temp.join("triangle.vert.spv");
         let fragment_path = temp.join("triangle.frag.spv");
-        compile::compile_stage(
-            &dir.join("triangle.slang"),
-            "vertexMain",
-            "vertex",
-            &dir,
-            Optimize::Debug,
-            &vertex_path,
-        )
-        .expect("vertex slangc");
-        compile::compile_stage(
-            &dir.join("triangle.slang"),
-            "fragmentMain",
-            "fragment",
-            &dir,
-            Optimize::Debug,
-            &fragment_path,
-        )
-        .expect("fragment slangc");
-        let vertex = words::spirv_words(&fs::read(&vertex_path).expect("read vertex"))
-            .expect("vertex words");
-        let fragment = words::spirv_words(&fs::read(&fragment_path).expect("read fragment"))
-            .expect("fragment words");
-        let interface = reflect_graphics(
-            &vertex,
-            "vertexMain",
-            &fragment,
-            "fragmentMain",
-            &Limits {
-                max_push_constants_size: 128,
-                max_bound_descriptor_sets: 4,
-            },
-        )
-        .expect("reflect");
+        let mut debug_interface = None;
+        for optimize in [Optimize::Debug, Optimize::Release] {
+            compile::compile_stage(
+                &dir.join("triangle.slang"),
+                "vertexMain",
+                "vertex",
+                &dir,
+                optimize,
+                &vertex_path,
+            )
+            .expect("vertex slangc");
+            compile::compile_stage(
+                &dir.join("triangle.slang"),
+                "fragmentMain",
+                "fragment",
+                &dir,
+                optimize,
+                &fragment_path,
+            )
+            .expect("fragment slangc");
+            let vertex = words::spirv_words(&fs::read(&vertex_path).expect("read vertex"))
+                .expect("vertex words");
+            let fragment = words::spirv_words(&fs::read(&fragment_path).expect("read fragment"))
+                .expect("fragment words");
+            let interface = reflect_graphics(
+                &vertex,
+                "vertexMain",
+                &fragment,
+                "fragmentMain",
+                &Limits {
+                    max_push_constants_size: 128,
+                    max_bound_descriptor_sets: 4,
+                },
+            )
+            .expect("reflect");
+            assert_eq!(interface.vertex_inputs, vec![0, 1, 2], "{optimize:?}");
+            if matches!(optimize, Optimize::Debug) {
+                debug_interface = Some(interface);
+            }
+        }
+        let interface = debug_interface.expect("debug reflect");
         validate_bindless(&interface).expect("bindless contract");
-        assert!(
-            interface.vertex_inputs.is_empty(),
-            "{:?}",
-            interface.vertex_inputs
-        );
         let set = interface.sets.first().expect("set 0");
         let textures = find_binding(set, 0);
         assert_eq!(textures.ty, vk::DescriptorType::SAMPLED_IMAGE);

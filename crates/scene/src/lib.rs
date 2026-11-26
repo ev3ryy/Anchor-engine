@@ -9,7 +9,7 @@ mod transform;
 pub(crate) use column::Column;
 pub use components::{
     AssetId, Camera, Component, ComponentId, ComponentMask, ComponentMaskIter, Draw, Extract,
-    ExtractedCamera, ExtractedLight, Light, MaterialRef, Mesh, MeshRenderer, Name,
+    ExtractedCamera, ExtractedLight, Light, MaterialRef, MeshRenderer, Model, Name, Primitive,
 };
 pub use entity::{Entity, Error};
 pub use glam::{Mat4, Quat, Vec3};
@@ -189,7 +189,7 @@ impl Scene {
             out.draws.push(Draw {
                 entity,
                 world,
-                mesh: mesh.mesh,
+                model: mesh.model,
                 material,
             });
         }

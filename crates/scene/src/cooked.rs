@@ -4,7 +4,8 @@ use bytemuck::{Pod, Zeroable, bytes_of, try_cast_slice, try_from_bytes};
 use glam::Mat4;
 
 use crate::{
-    AssetId, Camera, ComponentId, Light, Mesh, MeshRenderer, Name, Quat, Scene, Transform, Vec3,
+    AssetId, Camera, ComponentId, Light, MeshRenderer, Model, Name, Primitive, Quat, Scene,
+    Transform, Vec3,
 };
 
 pub const ALIGN: usize = 64;
@@ -13,6 +14,12 @@ pub const NONE: u32 = u32::MAX;
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SCN1");
 pub const VERSION: u32 = 1;
 pub const MESH_CUBE: u32 = 0;
+pub const MESH_SPHERE: u32 = 1;
+pub const MESH_CYLINDER: u32 = 2;
+pub const MESH_CAPSULE: u32 = 3;
+pub const MESH_PLANE: u32 = 4;
+pub const MESH_CONE: u32 = 5;
+pub const MESH_WEDGE: u32 = 6;
 pub const LIGHT_DIRECTIONAL: u32 = 0;
 
 const KNOWN_MASK: u32 = ComponentId::Name as u32
@@ -175,6 +182,13 @@ const _: () = assert!(size_of::<Header>() == HEADER_SIZE);
 const _: () = assert!(align_of::<Header>() <= ALIGN);
 const _: () = assert!(size_of::<CookedEntity>() == 32 && align_of::<CookedEntity>() == 16);
 const _: () = assert!(size_of::<CookedTransform>() == 48 && align_of::<CookedTransform>() == 16);
+const _: () = assert!(Primitive::Cube.kind() == MESH_CUBE);
+const _: () = assert!(Primitive::Sphere.kind() == MESH_SPHERE);
+const _: () = assert!(Primitive::Cylinder.kind() == MESH_CYLINDER);
+const _: () = assert!(Primitive::Capsule.kind() == MESH_CAPSULE);
+const _: () = assert!(Primitive::Plane.kind() == MESH_PLANE);
+const _: () = assert!(Primitive::Cone.kind() == MESH_CONE);
+const _: () = assert!(Primitive::Wedge.kind() == MESH_WEDGE);
 const _: () = assert!(size_of::<CookedMesh>() == 32 && align_of::<CookedMesh>() == 16);
 const _: () = assert!(std::mem::offset_of!(CookedMesh, material) == 16);
 const _: () = assert!(size_of::<CookedCamera>() == 32 && align_of::<CookedCamera>() == 16);
@@ -403,7 +417,7 @@ impl<'a> CookedScene<'a> {
             &mut masks,
         )?;
         for mesh in meshes {
-            if mesh.kind != MESH_CUBE {
+            if Primitive::from_kind(mesh.kind).is_none() {
                 return Err(Error::Kind);
             }
         }
@@ -506,7 +520,9 @@ impl<'a> CookedScene<'a> {
                 .insert(
                     spawned[mesh.entity as usize],
                     MeshRenderer {
-                        mesh: Mesh::Cube,
+                        model: Model::Primitive(
+                            Primitive::from_kind(mesh.kind).expect("validated primitive"),
+                        ),
                         material: AssetId(mesh.material),
                     },
                 )
@@ -710,7 +726,7 @@ mod tests {
     use glam::Mat4;
 
     use super::*;
-    use crate::{Mesh, MeshRenderer, Name, Scene, Vec3};
+    use crate::{MeshRenderer, Model, Name, Primitive, Scene, Vec3};
 
     fn sample() -> (Scene, AssetId) {
         let mut scene = Scene::new();
@@ -723,7 +739,7 @@ mod tests {
             .insert(
                 child,
                 MeshRenderer {
-                    mesh: Mesh::Cube,
+                    model: Model::Primitive(Primitive::Cube),
                     material,
                 },
             )
@@ -810,9 +826,10 @@ mod tests {
             ));
             worlds.push(scene.world(*entity).unwrap());
             if let Some(mesh) = scene.get::<MeshRenderer>(*entity).unwrap() {
+                let Model::Primitive(primitive) = mesh.model;
                 meshes.push(CookedMesh {
                     entity: index as u32,
-                    kind: MESH_CUBE,
+                    kind: primitive.kind(),
                     _pad: [0; 8],
                     material: mesh.material.0,
                 });
@@ -873,6 +890,10 @@ mod tests {
             material
         );
         assert_eq!(
+            loaded.get::<MeshRenderer>(child).unwrap().unwrap().model,
+            Model::Primitive(Primitive::Cube)
+        );
+        assert_eq!(
             loaded.world(child).unwrap(),
             scene
                 .world(
@@ -883,6 +904,63 @@ mod tests {
                         .unwrap()
                 )
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn sphere_and_wedge_roundtrip() {
+        let mut scene = Scene::new();
+        let sphere = scene.spawn();
+        let wedge = scene.spawn_child(sphere).unwrap();
+        let sphere_material = AssetId([3; 16]);
+        let wedge_material = AssetId([4; 16]);
+        scene
+            .insert(
+                sphere,
+                MeshRenderer {
+                    model: Model::Primitive(Primitive::Sphere),
+                    material: sphere_material,
+                },
+            )
+            .unwrap();
+        scene
+            .insert(
+                wedge,
+                MeshRenderer {
+                    model: Model::Primitive(Primitive::Wedge),
+                    material: wedge_material,
+                },
+            )
+            .unwrap();
+        scene.update();
+        let (entities, locals, worlds, meshes, strings, string_bytes, first_root) =
+            flat_from(&scene);
+        assert_eq!(meshes[0].kind, MESH_SPHERE);
+        assert_eq!(meshes[1].kind, MESH_WEDGE);
+        let bytes = write(&Flat {
+            first_root,
+            entities: &entities,
+            locals: &locals,
+            worlds: &worlds,
+            meshes: &meshes,
+            cameras: &[],
+            lights: &[],
+            strings: &strings,
+            string_bytes: &string_bytes,
+        })
+        .unwrap();
+        let loaded = CookedScene::validate(bytes.as_slice())
+            .unwrap()
+            .instantiate();
+        let root = loaded.roots().next().unwrap();
+        assert_eq!(
+            loaded.get::<MeshRenderer>(root).unwrap().unwrap().model,
+            Model::Primitive(Primitive::Sphere)
+        );
+        let child = loaded.children(root).unwrap().next().unwrap();
+        assert_eq!(
+            loaded.get::<MeshRenderer>(child).unwrap().unwrap().model,
+            Model::Primitive(Primitive::Wedge)
         );
     }
 

@@ -1,6 +1,6 @@
 use super::{
     AssetId, Camera, Column, ComponentId, ComponentMask, Entity, Error, Extract, Light, Mat4,
-    MaterialRef, Mesh, MeshRenderer, Name, Quat, Scene, Vec3,
+    MaterialRef, MeshRenderer, Model, Name, Primitive, Quat, Scene, Vec3,
 };
 
 fn any_material(_: AssetId) -> Option<MaterialRef> {
@@ -241,7 +241,7 @@ fn world_without_update_panics() {
 fn sample_components() -> (MeshRenderer, Camera, Light) {
     (
         MeshRenderer {
-            mesh: Mesh::Cube,
+            model: Model::Primitive(Primitive::Cube),
             material: asset(3),
         },
         Camera {
@@ -308,7 +308,7 @@ fn extract_reads_child_world_and_reuses_capacity() {
     let child = scene.spawn_child(root).unwrap();
     scene.set_local_position(child, Vec3::X).unwrap();
     let mesh = MeshRenderer {
-        mesh: Mesh::Cube,
+        model: Model::Primitive(Primitive::Cube),
         material: asset(1),
     };
     scene.insert(child, mesh).unwrap();
@@ -336,7 +336,7 @@ fn extract_reads_child_world_and_reuses_capacity() {
     scene.extract_into(&mut extract, any_material);
     assert_eq!(extract.draws.len(), 1);
     assert_eq!(extract.draws[0].entity, child);
-    assert_eq!(extract.draws[0].mesh, Mesh::Cube);
+    assert_eq!(extract.draws[0].model, Model::Primitive(Primitive::Cube));
     assert_eq!(extract.draws[0].world, scene.world(child).unwrap());
     assert_eq!(extract.cameras.len(), 1);
     assert_eq!(extract.cameras[0].fov_y, 0.8);
@@ -588,7 +588,7 @@ fn despawn_leaves_absent_columns_and_respawn_is_empty() {
     let kept = scene.spawn();
     let dropped = scene.spawn();
     let mesh = MeshRenderer {
-        mesh: Mesh::Cube,
+        model: Model::Primitive(Primitive::Cube),
         material: asset(1),
     };
     scene.insert(kept, mesh).unwrap();

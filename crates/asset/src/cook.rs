@@ -72,12 +72,12 @@ fn emit(nodes: &[ResolvedNode]) -> Result<cooked::AlignedBytes, Error> {
             _pad2: 0,
         });
         locals.push(CookedTransform::from_transform(node.transform));
-        if let Some(material) = node.mesh {
+        if let Some(mesh) = node.mesh {
             meshes.push(CookedMesh {
                 entity: index as u32,
-                kind: cooked::MESH_CUBE,
+                kind: mesh.primitive.kind(),
                 _pad: [0; 8],
-                material: material.0,
+                material: mesh.material.0,
             });
         }
         if let Some(camera) = node.camera {

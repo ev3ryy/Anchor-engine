@@ -7,8 +7,50 @@ use crate::{Entity, Error, Scene};
 const AXIS_EPSILON: f32 = 1.0e-8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Mesh {
-    Cube,
+#[repr(u32)]
+pub enum Primitive {
+    Cube = 0,
+    Sphere = 1,
+    Cylinder = 2,
+    Capsule = 3,
+    Plane = 4,
+    Cone = 5,
+    Wedge = 6,
+}
+
+impl Primitive {
+    pub const ALL: [Self; 7] = [
+        Self::Cube,
+        Self::Sphere,
+        Self::Cylinder,
+        Self::Capsule,
+        Self::Plane,
+        Self::Cone,
+        Self::Wedge,
+    ];
+
+    pub const fn kind(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn from_kind(kind: u32) -> Option<Self> {
+        match kind {
+            0 => Some(Self::Cube),
+            1 => Some(Self::Sphere),
+            2 => Some(Self::Cylinder),
+            3 => Some(Self::Capsule),
+            4 => Some(Self::Plane),
+            5 => Some(Self::Cone),
+            6 => Some(Self::Wedge),
+            _ => None,
+        }
+    }
+}
+
+/// What a mesh component draws. An imported asset can join this enum later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Model {
+    Primitive(Primitive),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -69,7 +111,7 @@ impl AssetId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshRenderer {
-    pub mesh: Mesh,
+    pub model: Model,
     pub material: AssetId,
 }
 
@@ -419,7 +461,7 @@ impl Scene {
 pub struct Draw {
     pub entity: Entity,
     pub world: Mat4,
-    pub mesh: Mesh,
+    pub model: Model,
     pub material: MaterialRef,
 }
 

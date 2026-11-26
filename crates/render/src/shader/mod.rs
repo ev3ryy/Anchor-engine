@@ -74,6 +74,7 @@ struct Program {
     vertex_entry: String,
     fragment_entry: String,
     state: GraphicsState,
+    vertex_layout: Option<pipeline::VertexLayout>,
     gpu: Gpu,
 }
 
@@ -245,12 +246,8 @@ impl ShaderSet {
         )
         .map_err(Error::ShaderInterface)?;
         reflect::validate_bindless(&interface).map_err(Error::ShaderInterface)?;
-        if !interface.vertex_inputs.is_empty() {
-            return Err(Error::ShaderInterface(format!(
-                "{} declares vertex inputs at locations {:?} without a vertex layout",
-                compiled.name, interface.vertex_inputs
-            )));
-        }
+        let vertex_layout = pipeline::mesh_vertex_layout(&compiled.name);
+        check_vertex_inputs(&compiled.name, &interface.vertex_inputs, vertex_layout)?;
         let state = state::description(&compiled.name);
         let gpu = self.build_gpu(
             &compiled.vertex,
@@ -258,6 +255,7 @@ impl ShaderSet {
             &compiled.vertex_entry,
             &compiled.fragment_entry,
             state,
+            vertex_layout.as_ref(),
             &[Vec::new()],
         )?;
         let name = compiled.name.clone();
@@ -267,6 +265,7 @@ impl ShaderSet {
             vertex_entry: compiled.vertex_entry,
             fragment_entry: compiled.fragment_entry,
             state,
+            vertex_layout,
             gpu,
         };
         if let Some(old) = self.programs.insert(name, program) {
@@ -276,7 +275,7 @@ impl ShaderSet {
     }
 
     fn rebuild(&mut self, name: &str) -> Result<(), Error> {
-        let (vertex, fragment, vertex_entry, fragment_entry, state, specs) = {
+        let (vertex, fragment, vertex_entry, fragment_entry, state, vertex_layout, specs) = {
             let program = self
                 .programs
                 .get(name)
@@ -287,6 +286,7 @@ impl ShaderSet {
                 program.vertex_entry.clone(),
                 program.fragment_entry.clone(),
                 program.state,
+                program.vertex_layout,
                 program.gpu.pipelines.keys().cloned().collect::<Vec<_>>(),
             )
         };
@@ -296,6 +296,7 @@ impl ShaderSet {
             &vertex_entry,
             &fragment_entry,
             state,
+            vertex_layout.as_ref(),
             &specs,
         )?;
         let program = self
@@ -314,6 +315,7 @@ impl ShaderSet {
         vertex_entry: &str,
         fragment_entry: &str,
         state: GraphicsState,
+        vertex_layout: Option<&pipeline::VertexLayout>,
         specs: &[Vec<(u32, u32)>],
     ) -> Result<Gpu, Error> {
         let modules = pipeline::create_modules(&self.device, vertex, fragment)?;
@@ -346,6 +348,7 @@ impl ShaderSet {
                 &fragment_name,
                 layout,
                 &state,
+                vertex_layout,
                 self.color_format,
                 self.depth_format,
                 spec,
@@ -367,7 +370,7 @@ impl ShaderSet {
     }
 
     fn create_variant(&mut self, name: &str, spec: &[(u32, u32)]) -> Result<(), Error> {
-        let (vertex_name, fragment_name, modules, layout, state) = {
+        let (vertex_name, fragment_name, modules, layout, state, vertex_layout) = {
             let program = self
                 .programs
                 .get(name)
@@ -384,6 +387,7 @@ impl ShaderSet {
                 },
                 program.gpu.layout,
                 program.state,
+                program.vertex_layout,
             )
         };
         let pipeline = pipeline::create_graphics(
@@ -394,6 +398,7 @@ impl ShaderSet {
             &fragment_name,
             layout,
             &state,
+            vertex_layout.as_ref(),
             self.color_format,
             self.depth_format,
             spec,
@@ -552,6 +557,34 @@ fn spec_key(spec: &[(u32, u32)]) -> Result<Vec<(u32, u32)>, Error> {
 #[cfg(debug_assertions)]
 fn shaders_dir() -> &'static std::path::Path {
     std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders"))
+}
+
+fn check_vertex_inputs(
+    name: &str,
+    inputs: &[u32],
+    layout: Option<pipeline::VertexLayout>,
+) -> Result<(), Error> {
+    match layout {
+        Some(layout) => {
+            let expected: Vec<u32> = layout
+                .attributes
+                .iter()
+                .map(|attribute| attribute.location)
+                .collect();
+            if inputs != expected {
+                return Err(Error::ShaderInterface(format!(
+                    "{name} vertex inputs {inputs:?} do not match the mesh layout {expected:?}"
+                )));
+            }
+        }
+        None if !inputs.is_empty() => {
+            return Err(Error::ShaderInterface(format!(
+                "{name} declares vertex inputs at locations {inputs:?} without a vertex layout"
+            )));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 #[cfg(not(debug_assertions))]

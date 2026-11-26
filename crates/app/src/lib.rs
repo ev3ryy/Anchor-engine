@@ -1,10 +1,18 @@
 mod map;
 
+use std::path::{Path, PathBuf};
+
 use window::winit::application::ApplicationHandler;
 use window::winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use window::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use window::winit::keyboard::PhysicalKey;
 use window::winit::window::{Window, WindowId};
+
+const CHECKER: scene::AssetId = scene::AssetId([
+    0xc0, 0xff, 0xee, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+]);
+
+const SCENE_GUID: &str = "c0ffee00-0000-4000-8000-000000000002";
 
 pub struct App {
     editor: Option<editor::Editor>,
@@ -17,6 +25,9 @@ pub struct App {
     extract: scene::Extract,
     last_frame: Option<std::time::Instant>,
     looking: bool,
+    scene_path: Option<PathBuf>,
+    scene_guid: String,
+    file_status: String,
 }
 
 impl App {
@@ -44,6 +55,67 @@ impl App {
             return Err(());
         }
         Ok(())
+    }
+
+    fn apply_file_actions(&mut self, actions: Vec<editor::FileAction>) {
+        for action in actions {
+            match action {
+                editor::FileAction::Open => self.open_scene(),
+                editor::FileAction::Save => self.save_scene(false),
+                editor::FileAction::SaveAs => self.save_scene(true),
+            }
+        }
+    }
+
+    fn save_scene(&mut self, save_as: bool) {
+        let Some(path) = self.pick_save_path(save_as) else {
+            return;
+        };
+        match write_scene(&self.scene, &self.scene_guid, &path) {
+            Ok(()) => {
+                self.file_status = format!("Saved {}", path.display());
+                self.scene_path = Some(path);
+            }
+            Err(err) => {
+                eprintln!("failed to save scene: {err}");
+                self.file_status = format!("Save failed: {err}");
+            }
+        }
+    }
+
+    fn open_scene(&mut self) {
+        let Some(path) = self.pick_open_path() else {
+            return;
+        };
+        match read_scene(&path) {
+            Ok((scene, guid)) => {
+                self.scene = scene;
+                self.scene_guid = guid;
+                self.scene_path = Some(path.clone());
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.clear_selection();
+                }
+                self.scene.update();
+                self.file_status = format!("Opened {}", path.display());
+            }
+            Err(err) => {
+                eprintln!("failed to open scene: {err}");
+                self.file_status = format!("Open failed: {err}");
+            }
+        }
+    }
+
+    fn pick_save_path(&self, save_as: bool) -> Option<PathBuf> {
+        if !save_as && let Some(path) = self.scene_path.clone() {
+            return Some(path);
+        }
+        file_dialog(self.window.as_ref())
+            .save_file()
+            .map(ensure_ron)
+    }
+
+    fn pick_open_path(&self) -> Option<PathBuf> {
+        file_dialog(self.window.as_ref()).pick_file()
     }
 }
 
@@ -105,7 +177,7 @@ impl ApplicationHandler for App {
             index: material.index,
             generation: material.generation,
         };
-        attach_child_mesh(&mut self.scene, material);
+        attach_child_mesh(&mut self.scene, CHECKER);
         self.material = Some(material);
         window.request_redraw();
         self.editor = Some(editor);
@@ -163,16 +235,17 @@ impl ApplicationHandler for App {
                     .as_ref()
                     .map(|window| window.inner_size())
                     .unwrap_or_default();
-                {
+                let actions = {
                     let App {
                         editor,
                         camera,
                         scene,
                         material,
                         window,
+                        file_status,
                         ..
                     } = self;
-                    if let (Some(editor), Some(window), Some(material)) =
+                    if let (Some(editor), Some(window), Some(_)) =
                         (editor.as_mut(), window.as_ref(), material.as_ref())
                     {
                         editor.begin_frame(
@@ -180,15 +253,25 @@ impl ApplicationHandler for App {
                             editor::FrameView {
                                 camera,
                                 scene,
-                                default_material: *material,
+                                default_material: CHECKER,
                                 dt,
                                 extent: [extent.width, extent.height],
+                                status: file_status,
                             },
-                        );
+                        )
+                    } else {
+                        Vec::new()
                     }
+                };
+                if !actions.is_empty() {
+                    self.apply_file_actions(actions);
+                    self.request_redraw();
                 }
                 self.scene.update();
-                self.scene.extract_into(&mut self.extract);
+                let gpu_material = self.material;
+                self.scene.extract_into(&mut self.extract, |asset| {
+                    if asset == CHECKER { gpu_material } else { None }
+                });
                 let target = self
                     .editor
                     .as_ref()
@@ -241,6 +324,18 @@ impl ApplicationHandler for App {
                         eprintln!("failed to draw: {err}");
                         failed = true;
                     }
+                }
+                let ctrl = self.input.key(input::Key::ControlLeft)
+                    || self.input.key(input::Key::ControlRight);
+                let save_shortcut = ctrl
+                    && self.input.key_pressed(input::Key::S)
+                    && !self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.wants_keyboard());
+                if save_shortcut {
+                    self.save_scene(false);
+                    self.request_redraw();
                 }
                 self.input.end_frame();
                 if failed {
@@ -360,7 +455,48 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
         extract: scene::Extract::default(),
         last_frame: None,
         looking: false,
+        scene_path: None,
+        scene_guid: SCENE_GUID.to_string(),
+        file_status: String::new(),
     })
+}
+
+fn file_dialog(window: Option<&Window>) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new().add_filter("Scene", &["ron"]);
+    match window {
+        Some(window) => dialog.set_parent(window),
+        None => dialog,
+    }
+}
+
+fn ensure_ron(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ron"))
+    {
+        path
+    } else {
+        path.with_extension("ron")
+    }
+}
+
+fn write_scene(scene: &scene::Scene, guid: &str, path: &Path) -> Result<(), String> {
+    let document = asset::scene_to_document(scene, guid, &asset::Assets::default())
+        .map_err(|err| err.to_string())?;
+    let text = asset::format_document(&document).map_err(|err| err.to_string())?;
+    std::fs::write(path, text).map_err(|err| err.to_string())
+}
+
+fn read_scene(path: &Path) -> Result<(scene::Scene, String), String> {
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let document = asset::parse_document(&text).map_err(|err| err.to_string())?;
+    if scene::AssetId::parse(&document.guid).is_none() {
+        return Err(format!("asset guid: {}", document.guid));
+    }
+    let guid = document.guid.clone();
+    let scene = asset::document_to_scene(&document, &asset::Assets::default())
+        .map_err(|err| err.to_string())?;
+    Ok((scene, guid))
 }
 
 fn demo_scene() -> scene::Scene {
@@ -378,7 +514,7 @@ fn demo_scene() -> scene::Scene {
     scene
 }
 
-fn attach_child_mesh(scene: &mut scene::Scene, material: scene::MaterialRef) {
+fn attach_child_mesh(scene: &mut scene::Scene, material: scene::AssetId) {
     let roots: Vec<_> = scene.roots().collect();
     let mut children = Vec::new();
     for root in roots {
@@ -442,7 +578,8 @@ fn drive_camera(
         if input.key(input::Key::W) {
             wish[2] += 1.0;
         }
-        if input.key(input::Key::S) {
+        let ctrl = input.key(input::Key::ControlLeft) || input.key(input::Key::ControlRight);
+        if input.key(input::Key::S) && !ctrl {
             wish[2] -= 1.0;
         }
     }

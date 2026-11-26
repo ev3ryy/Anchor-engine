@@ -1,7 +1,20 @@
 use super::{
-    Camera, Column, ComponentId, ComponentMask, Entity, Error, Extract, Light, Mat4, MaterialRef,
-    Mesh, MeshRenderer, Name, Quat, Scene, Vec3,
+    AssetId, Camera, Column, ComponentId, ComponentMask, Entity, Error, Extract, Light, Mat4,
+    MaterialRef, Mesh, MeshRenderer, Name, Quat, Scene, Vec3,
 };
+
+fn any_material(_: AssetId) -> Option<MaterialRef> {
+    Some(MaterialRef {
+        index: 1,
+        generation: 1,
+    })
+}
+
+fn asset(byte: u8) -> AssetId {
+    let mut bytes = [0; 16];
+    bytes[0] = byte;
+    AssetId(bytes)
+}
 
 fn translation(scene: &Scene, entity: Entity) -> Vec3 {
     scene.world(entity).unwrap().w_axis.truncate()
@@ -229,10 +242,7 @@ fn sample_components() -> (MeshRenderer, Camera, Light) {
     (
         MeshRenderer {
             mesh: Mesh::Cube,
-            material: MaterialRef {
-                index: 3,
-                generation: 1,
-            },
+            material: asset(3),
         },
         Camera {
             fov_y: 1.0,
@@ -299,10 +309,7 @@ fn extract_reads_child_world_and_reuses_capacity() {
     scene.set_local_position(child, Vec3::X).unwrap();
     let mesh = MeshRenderer {
         mesh: Mesh::Cube,
-        material: MaterialRef {
-            index: 1,
-            generation: 1,
-        },
+        material: asset(1),
     };
     scene.insert(child, mesh).unwrap();
     scene
@@ -326,7 +333,7 @@ fn extract_reads_child_world_and_reuses_capacity() {
         .unwrap();
     scene.update();
     let mut extract = Extract::default();
-    scene.extract_into(&mut extract);
+    scene.extract_into(&mut extract, any_material);
     assert_eq!(extract.draws.len(), 1);
     assert_eq!(extract.draws[0].entity, child);
     assert_eq!(extract.draws[0].mesh, Mesh::Cube);
@@ -342,7 +349,7 @@ fn extract_reads_child_world_and_reuses_capacity() {
     scene.remove::<MeshRenderer>(child).unwrap();
     scene.remove::<Camera>(child).unwrap();
     scene.remove::<Light>(child).unwrap();
-    scene.extract_into(&mut extract);
+    scene.extract_into(&mut extract, any_material);
     assert!(extract.draws.is_empty());
     assert!(extract.cameras.is_empty());
     assert!(extract.lights.is_empty());
@@ -450,7 +457,7 @@ fn extract_drops_degenerate_basis_and_keeps_mirrored_one() {
         Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)),
     );
     let mut extract = Extract::default();
-    scene.extract_into(&mut extract);
+    scene.extract_into(&mut extract, any_material);
     assert!(
         extract
             .cameras
@@ -500,7 +507,7 @@ fn extract_without_update_panics() {
     let entity = scene.spawn();
     scene.update();
     scene.set_local_position(entity, Vec3::X).unwrap();
-    scene.extract_into(&mut Extract::default());
+    scene.extract_into(&mut Extract::default(), any_material);
 }
 
 #[test]
@@ -582,10 +589,7 @@ fn despawn_leaves_absent_columns_and_respawn_is_empty() {
     let dropped = scene.spawn();
     let mesh = MeshRenderer {
         mesh: Mesh::Cube,
-        material: MaterialRef {
-            index: 1,
-            generation: 1,
-        },
+        material: asset(1),
     };
     scene.insert(kept, mesh).unwrap();
     scene.insert(dropped, Name::new("Gone")).unwrap();

@@ -11,9 +11,17 @@ type GpuRenderer = egui_ash_renderer::Renderer<egui_ash_renderer::allocator::Def
 pub struct FrameView<'a> {
     pub camera: &'a render::Camera,
     pub scene: &'a mut scene::Scene,
-    pub default_material: scene::MaterialRef,
+    pub default_material: scene::AssetId,
     pub dt: f32,
     pub extent: [u32; 2],
+    pub status: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    Open,
+    Save,
+    SaveAs,
 }
 
 #[derive(Debug)]
@@ -137,14 +145,33 @@ impl Editor {
         self.winit.on_window_event(window, event).repaint
     }
 
-    pub fn begin_frame(&mut self, window: &Window, view: FrameView<'_>) {
+    pub fn begin_frame(&mut self, window: &Window, view: FrameView<'_>) -> Vec<FileAction> {
         let mut dock = self.dock.take().unwrap_or_else(panels::dock_state);
         let mut selection = self.selection.take();
         let mut viewport_rect = None;
         let mut viewport_px = self.viewport_pixels().unwrap_or([0, 0]);
+        let mut actions = Vec::new();
         let scene = self.scene.as_ref().map(|scene| scene.id);
         let raw_input = self.winit.take_egui_input(window);
         let mut output = self.context.run_ui(raw_input, |ui| {
+            egui::Panel::top("menu").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open...").clicked() {
+                            actions.push(FileAction::Open);
+                        }
+                        if ui.button("Save").clicked() {
+                            actions.push(FileAction::Save);
+                        }
+                        if ui.button("Save As...").clicked() {
+                            actions.push(FileAction::SaveAs);
+                        }
+                    });
+                    if !view.status.is_empty() {
+                        ui.label(view.status);
+                    }
+                });
+            });
             let mut panels = Panels {
                 viewport: &mut viewport_rect,
                 viewport_px: &mut viewport_px,
@@ -185,6 +212,11 @@ impl Editor {
             .tessellate(output.shapes, output.pixels_per_point);
         self.winit
             .handle_platform_output(window, output.platform_output);
+        actions
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     /// Uploads `set` now and frees the previous frame's ids. This frame's frees wait until the

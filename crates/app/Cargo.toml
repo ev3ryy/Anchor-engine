@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+asset = { path = "../asset" }
 editor = { path = "../editor" }
 input = { path = "../input" }
 render = { path = "../render" }
+rfd = "0.15"
 scene = { path = "../scene" }
 window = { path = "../window" }

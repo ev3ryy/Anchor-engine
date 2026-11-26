@@ -17,7 +17,7 @@ pub(crate) struct Panels<'a> {
     pub scene: Option<egui::TextureId>,
     pub world: &'a mut scene::Scene,
     pub selection: &'a mut Option<scene::Entity>,
-    pub default_material: scene::MaterialRef,
+    pub default_material: scene::AssetId,
     pub camera: &'a Camera,
     pub dt: f32,
     pub extent: [u32; 2],
@@ -233,7 +233,7 @@ fn inspector(
     ui: &mut egui::Ui,
     world: &mut scene::Scene,
     selection: &Option<scene::Entity>,
-    default_material: scene::MaterialRef,
+    default_material: scene::AssetId,
 ) {
     let Some(entity) = *selection else {
         ui.label("No selection");
@@ -346,22 +346,39 @@ fn edit_component(
                 return;
             };
             ui.label("Cube");
-            let mut index = mesh.material.index;
-            let mut generation = mesh.material.generation;
-            let index_changed = drag_u32(ui, "Material", &mut index);
-            let generation_changed = drag_u32(ui, "Generation", &mut generation);
-            if index_changed || generation_changed {
-                let _ = world.insert(
-                    entity,
-                    scene::MeshRenderer {
-                        mesh: scene::Mesh::Cube,
-                        material: scene::MaterialRef { index, generation },
-                    },
-                );
-            }
+            edit_material(ui, world, entity, mesh.material);
         }
         scene::ComponentId::Camera => edit_camera(ui, world, entity),
         scene::ComponentId::Light => edit_light(ui, world, entity),
+    }
+}
+
+fn edit_material(
+    ui: &mut egui::Ui,
+    world: &mut scene::Scene,
+    entity: scene::Entity,
+    material: scene::AssetId,
+) {
+    let id = egui::Id::new(("mesh-material", entity));
+    let mut text = ui
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_else(|| material.canonical());
+    let response = ui.text_edit_singleline(&mut text);
+    if response.changed()
+        && let Some(material) = scene::AssetId::parse(&text)
+    {
+        let _ = world.insert(
+            entity,
+            scene::MeshRenderer {
+                mesh: scene::Mesh::Cube,
+                material,
+            },
+        );
+    }
+    if response.lost_focus() {
+        ui.data_mut(|data| data.remove::<String>(id));
+    } else if response.has_focus() {
+        ui.data_mut(|data| data.insert_temp(id, text));
     }
 }
 
@@ -462,7 +479,7 @@ fn add_component(
     world: &mut scene::Scene,
     entity: scene::Entity,
     id: scene::ComponentId,
-    default_material: scene::MaterialRef,
+    default_material: scene::AssetId,
 ) {
     match id {
         scene::ComponentId::Name => {
@@ -582,14 +599,6 @@ fn drag_euler(ui: &mut egui::Ui, degrees: &mut [f32; 3]) -> bool {
             )
             .changed();
         yaw || pitch || roll
-    })
-    .inner
-}
-
-fn drag_u32(ui: &mut egui::Ui, label: &str, value: &mut u32) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::DragValue::new(value).speed(1.0)).changed()
     })
     .inner
 }

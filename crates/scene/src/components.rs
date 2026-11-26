@@ -17,10 +17,60 @@ pub struct MaterialRef {
     pub generation: u32,
 }
 
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,
+)]
+pub struct AssetId(pub [u8; 16]);
+
+impl AssetId {
+    pub fn parse(text: &str) -> Option<Self> {
+        let hyphenated = text.len() == 36;
+        if hyphenated {
+            let bytes = text.as_bytes();
+            if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
+                return None;
+            }
+        }
+        let hex: Vec<u8> = text.bytes().filter(|byte| *byte != b'-').collect();
+        if hex.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0; 16];
+        for index in 0..16 {
+            let pair = std::str::from_utf8(&hex[index * 2..index * 2 + 2]).ok()?;
+            bytes[index] = u8::from_str_radix(pair, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+
+    pub fn canonical(self) -> String {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            self.0[0],
+            self.0[1],
+            self.0[2],
+            self.0[3],
+            self.0[4],
+            self.0[5],
+            self.0[6],
+            self.0[7],
+            self.0[8],
+            self.0[9],
+            self.0[10],
+            self.0[11],
+            self.0[12],
+            self.0[13],
+            self.0[14],
+            self.0[15],
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshRenderer {
     pub mesh: Mesh,
-    pub material: MaterialRef,
+    pub material: AssetId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

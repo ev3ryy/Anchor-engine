@@ -1,3 +1,5 @@
+pub mod cooked;
+
 mod column;
 mod components;
 mod entity;
@@ -6,7 +8,7 @@ mod transform;
 
 pub(crate) use column::Column;
 pub use components::{
-    Camera, Component, ComponentId, ComponentMask, ComponentMaskIter, Draw, Extract,
+    AssetId, Camera, Component, ComponentId, ComponentMask, ComponentMaskIter, Draw, Extract,
     ExtractedCamera, ExtractedLight, Light, MaterialRef, Mesh, MeshRenderer, Name,
 };
 pub use entity::{Entity, Error};
@@ -168,7 +170,11 @@ impl Scene {
         Ok(self.world[dense])
     }
 
-    pub fn extract_into(&self, out: &mut Extract) {
+    pub fn extract_into(
+        &self,
+        out: &mut Extract,
+        mut resolve: impl FnMut(AssetId) -> Option<MaterialRef>,
+    ) {
         debug_assert!(!self.transforms_dirty);
         out.draws.clear();
         out.cameras.clear();
@@ -177,11 +183,14 @@ impl Scene {
             let Some(world) = self.world_matrix(entity) else {
                 continue;
             };
+            let Some(material) = resolve(mesh.material) else {
+                continue;
+            };
             out.draws.push(Draw {
                 entity,
                 world,
                 mesh: mesh.mesh,
-                material: mesh.material,
+                material,
             });
         }
         for (entity, camera) in self.cameras.iter() {

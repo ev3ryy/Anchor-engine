@@ -67,7 +67,20 @@ pub(crate) fn vertex_count(mesh: scene::Mesh) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use scene::{Extract, MaterialRef, Mesh, MeshRenderer, Scene, Vec3};
+    use scene::{AssetId, Extract, MaterialRef, Mesh, MeshRenderer, Scene, Vec3};
+
+    fn asset(index: u32, generation: u32) -> AssetId {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&index.to_le_bytes());
+        bytes[4..8].copy_from_slice(&generation.to_le_bytes());
+        AssetId(bytes)
+    }
+
+    fn bind(asset: AssetId) -> Option<MaterialRef> {
+        let index = u32::from_le_bytes(asset.0[..4].try_into().unwrap());
+        let generation = u32::from_le_bytes(asset.0[4..8].try_into().unwrap());
+        Some(MaterialRef { index, generation })
+    }
 
     use super::plan_draws;
     use crate::material::MaterialStore;
@@ -84,10 +97,7 @@ mod tests {
                     entity,
                     MeshRenderer {
                         mesh: Mesh::Cube,
-                        material: MaterialRef {
-                            index: index as u32,
-                            generation,
-                        },
+                        material: asset(index as u32, generation),
                     },
                 )
                 .unwrap();
@@ -97,7 +107,7 @@ mod tests {
         }
         scene.update();
         let mut extract = Extract::default();
-        scene.extract_into(&mut extract);
+        scene.extract_into(&mut extract, bind);
         extract.draws
     }
 
@@ -152,10 +162,7 @@ mod tests {
                 kept,
                 MeshRenderer {
                     mesh: Mesh::Cube,
-                    material: MaterialRef {
-                        index: live.index,
-                        generation: live.generation,
-                    },
+                    material: asset(live.index, live.generation),
                 },
             )
             .unwrap();
@@ -164,16 +171,13 @@ mod tests {
                 dropped,
                 MeshRenderer {
                     mesh: Mesh::Cube,
-                    material: MaterialRef {
-                        index: stale.index,
-                        generation: stale.generation,
-                    },
+                    material: asset(stale.index, stale.generation),
                 },
             )
             .unwrap();
         scene.update();
         let mut extract = Extract::default();
-        scene.extract_into(&mut extract);
+        scene.extract_into(&mut extract, bind);
         let mut order = Vec::new();
         let mut batches = Vec::new();
         plan_draws(
@@ -210,10 +214,7 @@ mod tests {
                 later,
                 MeshRenderer {
                     mesh: Mesh::Cube,
-                    material: MaterialRef {
-                        index: 4,
-                        generation: 1,
-                    },
+                    material: asset(4, 1),
                 },
             )
             .unwrap();
@@ -222,16 +223,13 @@ mod tests {
                 earlier,
                 MeshRenderer {
                     mesh: Mesh::Cube,
-                    material: MaterialRef {
-                        index: 1,
-                        generation: 1,
-                    },
+                    material: asset(1, 1),
                 },
             )
             .unwrap();
         scene.update();
         let mut extract = Extract::default();
-        scene.extract_into(&mut extract);
+        scene.extract_into(&mut extract, bind);
         let mut order = Vec::new();
         let mut batches = Vec::new();
         plan_draws(

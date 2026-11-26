@@ -563,7 +563,8 @@ fn drive_camera(
 ) {
     let mut wish = [0.0; 3];
     if !keyboard_captured {
-        if input.key(input::Key::D) {
+        let ctrl = input.key(input::Key::ControlLeft) || input.key(input::Key::ControlRight);
+        if input.key(input::Key::D) && !ctrl {
             wish[0] += 1.0;
         }
         if input.key(input::Key::A) {
@@ -578,7 +579,6 @@ fn drive_camera(
         if input.key(input::Key::W) {
             wish[2] += 1.0;
         }
-        let ctrl = input.key(input::Key::ControlLeft) || input.key(input::Key::ControlRight);
         if input.key(input::Key::S) && !ctrl {
             wish[2] -= 1.0;
         }

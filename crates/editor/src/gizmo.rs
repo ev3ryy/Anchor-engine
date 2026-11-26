@@ -77,13 +77,10 @@ impl ObjectGizmo {
         let Ok(world_matrix) = world.world(entity) else {
             return false;
         };
-        self.aim(
-            ui,
-            viewport,
-            camera,
-            &pointer,
-            gizmo_transform(world_matrix),
-        );
+        let Some(target) = gizmo_transform(world_matrix) else {
+            return false;
+        };
+        self.aim(ui, viewport, camera, &pointer, target);
         viewport.contains(pos) && self.inner.pick_preview((pos.x, pos.y))
     }
 
@@ -128,7 +125,9 @@ impl ObjectGizmo {
         let Ok(world_matrix) = world.world(entity) else {
             return;
         };
-        let target = gizmo_transform(world_matrix);
+        let Some(target) = gizmo_transform(world_matrix) else {
+            return;
+        };
         let pointer = pointer_state(ui);
         if !pointer.primary {
             self.dragging = false;
@@ -274,21 +273,31 @@ fn row_matrix(matrix: glam::Mat4) -> RowMatrix4<f64> {
     matrix.as_dmat4().into()
 }
 
-fn gizmo_transform(matrix: scene::Mat4) -> Transform {
+/// Zero (or near-zero) scale makes the matrix singular; glam then yields NaN rotation,
+/// which crashes egui's tessellator when the gizmo mesh is painted.
+fn gizmo_transform(matrix: scene::Mat4) -> Option<Transform> {
     let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
-    Transform::from_scale_rotation_translation(
+    if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
+        return None;
+    }
+    if scale.x.abs() < 1.0e-8 || scale.y.abs() < 1.0e-8 || scale.z.abs() < 1.0e-8 {
+        return None;
+    }
+    Some(Transform::from_scale_rotation_translation(
         scale.as_dvec3(),
         rotation.as_dquat(),
         translation.as_dvec3(),
-    )
+    ))
 }
 
 fn apply_world(world: &mut scene::Scene, entity: scene::Entity, transform: Transform) {
-    let world_matrix = scene::Mat4::from_scale_rotation_translation(
-        vec3(transform.scale),
-        quat(transform.rotation),
-        vec3(transform.translation),
-    );
+    let scale = vec3(transform.scale);
+    let rotation = quat(transform.rotation);
+    let translation = vec3(transform.translation);
+    if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
+        return;
+    }
+    let world_matrix = scene::Mat4::from_scale_rotation_translation(scale, rotation, translation);
     let parent = match world.parent(entity) {
         Ok(parent) => parent,
         Err(_) => return,
@@ -305,6 +314,9 @@ fn apply_world(world: &mut scene::Scene, entity: scene::Entity, transform: Trans
     }
     let local = parent_matrix.inverse() * world_matrix;
     let (scale, rotation, translation) = local.to_scale_rotation_translation();
+    if !scale.is_finite() || !rotation.is_finite() || !translation.is_finite() {
+        return;
+    }
     let _ = world.set_local_scale(entity, scale);
     let _ = world.set_local_rotation(entity, rotation);
     let _ = world.set_local_position(entity, translation);
@@ -326,6 +338,13 @@ fn quat(value: Quaternion<f64>) -> scene::Quat {
 fn paint(ui: &egui::Ui, viewport: egui::Rect, gizmo: &Gizmo) {
     let draw = gizmo.draw();
     if draw.vertices.is_empty() {
+        return;
+    }
+    if draw
+        .vertices
+        .iter()
+        .any(|pos| !pos[0].is_finite() || !pos[1].is_finite())
+    {
         return;
     }
     ui.painter().with_clip_rect(viewport).add(egui::Mesh {
@@ -374,7 +393,8 @@ mod tests {
             scale,
             rotation,
             translation + scene::Vec3::Y,
-        ));
+        ))
+        .expect("finite transform");
         apply_world(&mut scene, child, moved);
         scene.update();
         let got = scene.world(child).expect("child").w_axis.truncate();
@@ -383,5 +403,15 @@ mod tests {
             scene.local(parent).expect("parent").translation,
             scene::Vec3::X * 2.0
         );
+    }
+
+    #[test]
+    fn zero_scale_is_rejected() {
+        let matrix = scene::Mat4::from_scale_rotation_translation(
+            scene::Vec3::new(1.0, 0.0, 1.0),
+            scene::Quat::IDENTITY,
+            scene::Vec3::ZERO,
+        );
+        assert!(gizmo_transform(matrix).is_none());
     }
 }

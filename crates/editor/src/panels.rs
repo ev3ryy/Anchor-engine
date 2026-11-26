@@ -29,6 +29,7 @@ enum HierarchyAction {
     CreateRoot,
     CreateChild(scene::Entity),
     Delete(scene::Entity),
+    Duplicate(scene::Entity),
 }
 
 pub(crate) fn dock_state() -> DockState<Tab> {
@@ -172,7 +173,37 @@ fn hierarchy_panel(
     for root in roots {
         hierarchy_node(ui, world, selection, &mut action, root, 0);
     }
+    if action.is_none() {
+        action = hierarchy_shortcut(ui, *selection);
+    }
     action
+}
+
+fn hierarchy_shortcut(
+    ui: &mut egui::Ui,
+    selection: Option<scene::Entity>,
+) -> Option<HierarchyAction> {
+    let Some(entity) = selection else {
+        return None;
+    };
+    if ui.ctx().text_edit_focused() {
+        return None;
+    }
+    ui.input_mut(|input| {
+        if input.consume_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::Delete,
+        )) {
+            return Some(HierarchyAction::Delete(entity));
+        }
+        if input.consume_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL,
+            egui::Key::D,
+        )) {
+            return Some(HierarchyAction::Duplicate(entity));
+        }
+        None
+    })
 }
 
 fn hierarchy_node(
@@ -242,6 +273,85 @@ fn apply_hierarchy(
                 && selection.is_some_and(|selected| destroyed.contains(&selected))
             {
                 *selection = None;
+            }
+        }
+        HierarchyAction::Duplicate(entity) => {
+            if let Some(copy) = duplicate(world, entity) {
+                *selection = Some(copy);
+            }
+        }
+    }
+}
+
+fn duplicate(world: &mut scene::Scene, entity: scene::Entity) -> Option<scene::Entity> {
+    let parent = world.parent(entity).ok()?;
+    duplicate_tree(world, entity, parent)
+}
+
+fn duplicate_tree(
+    world: &mut scene::Scene,
+    entity: scene::Entity,
+    parent: Option<scene::Entity>,
+) -> Option<scene::Entity> {
+    let local = world.local(entity).ok()?;
+    let copy = match parent {
+        Some(parent) => world.spawn_child(parent).ok()?,
+        None => world.spawn(),
+    };
+    let _ = world.set_local_position(copy, local.translation);
+    let _ = world.set_local_rotation(copy, local.rotation);
+    let _ = world.set_local_scale(copy, local.scale);
+    copy_components(world, entity, copy);
+    let children: Vec<_> = world
+        .children(entity)
+        .map(|children| children.collect())
+        .unwrap_or_default();
+    for child in children {
+        duplicate_tree(world, child, Some(copy));
+    }
+    Some(copy)
+}
+
+fn copy_components(world: &mut scene::Scene, from: scene::Entity, to: scene::Entity) {
+    let Ok(mask) = world.components(from) else {
+        return;
+    };
+    let ids: Vec<_> = mask.iter().collect();
+    for id in ids {
+        match id {
+            scene::ComponentId::Name => {
+                let Some(name) = world
+                    .get::<scene::Name>(from)
+                    .ok()
+                    .flatten()
+                    .map(|name| name.as_str().to_string())
+                else {
+                    continue;
+                };
+                let _ = world.insert(to, scene::Name::new(name));
+            }
+            scene::ComponentId::Mesh => {
+                let Some(mesh) = world
+                    .get::<scene::MeshRenderer>(from)
+                    .ok()
+                    .flatten()
+                    .copied()
+                else {
+                    continue;
+                };
+                let _ = world.insert(to, mesh);
+            }
+            scene::ComponentId::Camera => {
+                let Some(camera) = world.get::<scene::Camera>(from).ok().flatten().copied() else {
+                    continue;
+                };
+                let _ = world.insert(to, camera);
+            }
+            scene::ComponentId::Light => {
+                let Some(light) = world.get::<scene::Light>(from).ok().flatten().copied() else {
+                    continue;
+                };
+                let _ = world.insert(to, light);
             }
         }
     }

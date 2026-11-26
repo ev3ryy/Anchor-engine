@@ -25,10 +25,13 @@ const _: () = assert!(std::mem::size_of::<FramePush>() == 80);
 pub struct FramePush {
     pub view_proj: [f32; 16],
     pub material_index: u32,
-    pub pad0: u32,
+    pub instance_base: u32,
     pub pad1: u32,
     pub pad2: u32,
 }
+
+const _: () = assert!(std::mem::offset_of!(FramePush, material_index) == 64);
+const _: () = assert!(std::mem::offset_of!(FramePush, instance_base) == 68);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaterialId {
@@ -207,6 +210,13 @@ fn next_generation(generation: u32) -> u32 {
 mod tests {
     use super::{HEADER_STRIDE, MaterialRef, MaterialStore, PARAM_STRIDE, TYPE_UNLIT, write_color};
     use crate::texture::SamplerId;
+
+    #[test]
+    fn frame_push_tail_starts_at_byte_64() {
+        assert_eq!(std::mem::size_of::<super::FramePush>(), 80);
+        assert_eq!(std::mem::offset_of!(super::FramePush, material_index), 64);
+        assert_eq!(std::mem::offset_of!(super::FramePush, instance_base), 68);
+    }
 
     #[test]
     fn unlit_color_is_sixteen_bytes_at_the_slot_origin() {

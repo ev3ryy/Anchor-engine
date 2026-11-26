@@ -121,7 +121,12 @@ impl TabViewer for Panels<'_> {
 fn hierarchy(ui: &mut egui::Ui, world: &scene::Scene, entity: scene::Entity, depth: usize) {
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        let label = world.name(entity).ok().flatten().unwrap_or("Entity");
+        let label = world
+            .get::<scene::Name>(entity)
+            .ok()
+            .flatten()
+            .map(scene::Name::as_str)
+            .unwrap_or("Entity");
         ui.label(label);
     });
     if let Ok(children) = world.children(entity) {

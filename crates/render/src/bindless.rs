@@ -2,6 +2,7 @@ use ash::{Device, Instance, vk};
 
 use crate::Error;
 use crate::gpu::GpuBuffer;
+use crate::instances;
 use crate::material::{
     HEADER_STRIDE, MATERIAL_CAPACITY, MaterialDesc, MaterialId, MaterialStore, PARAM_STRIDE,
 };
@@ -17,6 +18,7 @@ pub struct Bindless {
     samplers: Vec<vk::Sampler>,
     headers: GpuBuffer,
     params: GpuBuffer,
+    worlds: GpuBuffer,
     textures: TextureStore,
     materials: MaterialStore,
 }
@@ -112,6 +114,28 @@ impl Bindless {
             }
         };
 
+        let world_bytes = instances::CAPACITY as vk::DeviceSize
+            * std::mem::size_of::<glam::Mat4>() as vk::DeviceSize;
+        let worlds = match GpuBuffer::host_visible(
+            instance,
+            physical_device,
+            device,
+            world_bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        ) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                drop(params);
+                drop(headers);
+                unsafe {
+                    device.destroy_descriptor_pool(pool, None);
+                    device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_set_layout(set_layout, None);
+                }
+                return Err(err);
+            }
+        };
+
         let mut heap = Self {
             device: device.clone(),
             set_layout,
@@ -121,13 +145,16 @@ impl Bindless {
             samplers: Vec::new(),
             headers,
             params,
+            worlds,
             textures: TextureStore::new(instance, physical_device, device, texture_capacity),
             materials: MaterialStore::new(MATERIAL_CAPACITY),
         };
         let header = heap.headers.buffer;
         let params = heap.params.buffer;
+        let worlds = heap.worlds.buffer;
         heap.write_buffer(2, header)?;
         heap.write_buffer(3, params)?;
+        heap.write_buffer(4, worlds)?;
         heap.create_samplers()?;
         Ok(heap)
     }
@@ -187,6 +214,16 @@ impl Bindless {
 
     pub fn material_index(&self, id: MaterialId) -> Result<u32, Error> {
         self.materials.index(id)
+    }
+
+    pub fn write_worlds(&mut self, draws: &[scene::Draw], order: &[usize]) {
+        debug_assert!(order.len() <= instances::CAPACITY);
+        let mapped = self.worlds.mapped().cast::<glam::Mat4>();
+        for (slot, &index) in order.iter().enumerate() {
+            unsafe {
+                mapped.add(slot).write(draws[index].world);
+            }
+        }
     }
 
     pub fn flush(&mut self) {
@@ -298,9 +335,15 @@ fn create_set_layout(
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(1)
             .stage_flags(stages),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
     ];
     let flags = [
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
@@ -348,7 +391,7 @@ fn create_pool(device: &Device, texture_capacity: u32) -> Result<vk::DescriptorP
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 2,
+            descriptor_count: 3,
         },
     ];
     let info = vk::DescriptorPoolCreateInfo::default()

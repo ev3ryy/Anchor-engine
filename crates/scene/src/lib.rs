@@ -1,13 +1,19 @@
 mod column;
+mod components;
 mod entity;
 mod hierarchy;
 mod transform;
 
-pub use column::Column;
+pub(crate) use column::Column;
+pub use components::{
+    Camera, Component, ComponentId, ComponentMask, ComponentMaskIter, Draw, Extract,
+    ExtractedCamera, ExtractedLight, Light, MaterialRef, Mesh, MeshRenderer, Name,
+};
 pub use entity::{Entity, Error};
 pub use glam::{Mat4, Quat, Vec3};
 pub use transform::Transform;
 
+use components::basis;
 use entity::{NONE, next_generation};
 use hierarchy::Hierarchy;
 use transform::local_matrix;
@@ -25,7 +31,11 @@ pub struct Scene {
     world: Vec<Mat4>,
     parent_dense: Vec<u32>,
     hierarchy: Hierarchy,
-    names: Column<String>,
+    masks: Vec<u32>,
+    names: Column<Name>,
+    meshes: Column<MeshRenderer>,
+    cameras: Column<Camera>,
+    lights: Column<Light>,
     structure_dirty: bool,
     transforms_dirty: bool,
 }
@@ -42,7 +52,11 @@ impl Scene {
             world: Vec::new(),
             parent_dense: Vec::new(),
             hierarchy: Hierarchy::new(),
+            masks: Vec::new(),
             names: Column::new(),
+            meshes: Column::new(),
+            cameras: Column::new(),
+            lights: Column::new(),
             structure_dirty: false,
             transforms_dirty: false,
         }
@@ -71,7 +85,7 @@ impl Scene {
         for slot in slots {
             let generation = self.generations[slot as usize];
             let entity = Entity::new(slot, generation);
-            self.names.remove(entity);
+            self.clear_components(entity);
             destroyed.push(entity);
             self.generations[slot as usize] = next_generation(generation);
             self.live[slot as usize] = false;
@@ -154,15 +168,56 @@ impl Scene {
         Ok(self.world[dense])
     }
 
-    pub fn set_name(&mut self, entity: Entity, name: impl Into<String>) -> Result<(), Error> {
-        self.slot(entity)?;
-        self.names.insert(entity, name.into());
-        Ok(())
-    }
-
-    pub fn name(&self, entity: Entity) -> Result<Option<&str>, Error> {
-        self.slot(entity)?;
-        Ok(self.names.get(entity).map(String::as_str))
+    pub fn extract_into(&self, out: &mut Extract) {
+        debug_assert!(!self.transforms_dirty);
+        out.draws.clear();
+        out.cameras.clear();
+        out.lights.clear();
+        for (entity, mesh) in self.meshes.iter() {
+            let Some(world) = self.world_matrix(entity) else {
+                continue;
+            };
+            out.draws.push(Draw {
+                entity,
+                world,
+                mesh: mesh.mesh,
+                material: mesh.material,
+            });
+        }
+        for (entity, camera) in self.cameras.iter() {
+            let Some(world) = self.world_matrix(entity) else {
+                continue;
+            };
+            let Some((x_axis, y_axis, z_axis)) = basis(world) else {
+                continue;
+            };
+            out.cameras.push(components::ExtractedCamera {
+                entity,
+                position: world.w_axis.truncate(),
+                x_axis,
+                y_axis,
+                z_axis,
+                fov_y: camera.fov_y,
+                near: camera.near,
+                far: camera.far,
+            });
+        }
+        for (entity, light) in self.lights.iter() {
+            let Light::Directional { color, intensity } = light;
+            let Some(world) = self.world_matrix(entity) else {
+                continue;
+            };
+            let Some((_, _, z_axis)) = basis(world) else {
+                continue;
+            };
+            out.lights.push(components::ExtractedLight {
+                entity,
+                position: world.w_axis.truncate(),
+                direction: -z_axis,
+                color: *color,
+                intensity: *intensity,
+            });
+        }
     }
 
     pub fn update(&mut self) {
@@ -191,6 +246,7 @@ impl Scene {
         self.generations.push(0);
         self.live.push(false);
         self.sparse.push(NONE);
+        self.masks.push(0);
         self.hierarchy.push_slot();
         slot
     }
@@ -200,6 +256,7 @@ impl Scene {
         let generation = next_generation(self.generations[index]);
         self.generations[index] = generation;
         self.live[index] = true;
+        self.masks[index] = 0;
         let dense = self.dense_to_slot.len() as u32;
         self.sparse[index] = dense;
         self.dense_to_slot.push(slot);
@@ -304,6 +361,40 @@ impl Scene {
         let dense = self.dense(entity)?;
         self.transforms_dirty = true;
         Ok(&mut self.local[dense])
+    }
+
+    fn clear_components(&mut self, entity: Entity) {
+        let slot = entity.index() as usize;
+        let mask = ComponentMask(self.masks[slot]);
+        for id in mask.iter() {
+            match id {
+                ComponentId::Name => {
+                    self.names.remove(entity);
+                }
+                ComponentId::Mesh => {
+                    self.meshes.remove(entity);
+                }
+                ComponentId::Camera => {
+                    self.cameras.remove(entity);
+                }
+                ComponentId::Light => {
+                    self.lights.remove(entity);
+                }
+            }
+        }
+        self.masks[slot] = 0;
+    }
+
+    fn world_matrix(&self, entity: Entity) -> Option<Mat4> {
+        let slot = entity.index() as usize;
+        if self.generations.get(slot).copied() != Some(entity.generation()) {
+            return None;
+        }
+        let dense = *self.sparse.get(slot)?;
+        if dense == NONE {
+            return None;
+        }
+        self.world.get(dense as usize).copied()
     }
 
     fn entity_at(&self, slot: u32) -> Entity {

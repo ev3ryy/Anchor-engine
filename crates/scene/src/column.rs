@@ -1,7 +1,7 @@
 use crate::entity::{Entity, NONE};
 
 #[derive(Clone, Debug)]
-pub struct Column<T> {
+pub(crate) struct Column<T> {
     sparse: Vec<u32>,
     slots: Vec<u32>,
     generations: Vec<u32>,
@@ -18,7 +18,7 @@ impl<T> Column<T> {
         }
     }
 
-    pub fn insert(&mut self, entity: Entity, value: T) {
+    pub fn insert(&mut self, entity: Entity, value: T) -> Option<T> {
         let slot = entity.index() as usize;
         if self.sparse.len() <= slot {
             self.sparse.resize(slot + 1, NONE);
@@ -28,14 +28,14 @@ impl<T> Column<T> {
             let dense = dense as usize;
             self.slots[dense] = entity.index();
             self.generations[dense] = entity.generation();
-            self.values[dense] = value;
-            return;
+            return Some(std::mem::replace(&mut self.values[dense], value));
         }
         let dense = self.values.len() as u32;
         self.sparse[slot] = dense;
         self.slots.push(entity.index());
         self.generations.push(entity.generation());
         self.values.push(value);
+        None
     }
 
     pub fn get(&self, entity: Entity) -> Option<&T> {
@@ -66,6 +66,14 @@ impl<T> Column<T> {
             .iter()
             .zip(self.generations.iter())
             .zip(self.values.iter())
+            .map(|((slot, generation), value)| (Entity::new(*slot, *generation), value))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> + '_ {
+        self.slots
+            .iter()
+            .zip(self.generations.iter())
+            .zip(self.values.iter_mut())
             .map(|((slot, generation), value)| (Entity::new(*slot, *generation), value))
     }
 

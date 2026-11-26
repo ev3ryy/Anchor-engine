@@ -22,7 +22,7 @@ ByteAddressBuffer material_params;
 struct FramePush {
     column_major float4x4 view_proj;
     uint material_index;
-    uint pad0;
+    uint instance_base;
     uint pad1;
     uint pad2;
 };

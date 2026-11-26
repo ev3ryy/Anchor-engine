@@ -5,6 +5,7 @@ mod depth;
 mod device;
 mod gpu;
 mod instance;
+mod instances;
 mod material;
 mod pipeline;
 mod queue;
@@ -42,6 +43,7 @@ pub enum Error {
     InvalidImage,
     OutOfTextures,
     OutOfMaterials,
+    OutOfInstances,
     StaleTexture,
     StaleMaterial,
     Shader(std::io::Error),
@@ -80,6 +82,7 @@ impl std::fmt::Display for Error {
             Self::InvalidImage => write!(f, "texture byte length does not match its extent"),
             Self::OutOfTextures => write!(f, "bindless texture heap is full"),
             Self::OutOfMaterials => write!(f, "material table is full"),
+            Self::OutOfInstances => write!(f, "instance buffer is full"),
             Self::StaleTexture => write!(f, "texture handle is stale"),
             Self::StaleMaterial => write!(f, "material handle is stale"),
             Self::Shader(err) => write!(f, "failed to read SPIR-V: {err}"),
@@ -113,6 +116,7 @@ impl std::error::Error for Error {
             | Self::InvalidImage
             | Self::OutOfTextures
             | Self::OutOfMaterials
+            | Self::OutOfInstances
             | Self::StaleTexture
             | Self::StaleMaterial
             | Self::ShaderCompile { .. }
@@ -167,6 +171,8 @@ pub struct Context {
     viewport: Option<viewport::ViewportTarget>,
     retired_viewports: Vec<viewport::ViewportTarget>,
     depth: Option<depth::DepthBuffer>,
+    draw_order: Vec<usize>,
+    draw_batches: Vec<instances::Batch>,
     device: device::DeviceBundle,
     surface: surface::SurfaceBundle,
     instance: instance::InstanceBundle,
@@ -235,6 +241,8 @@ impl Context {
             viewport: None,
             retired_viewports: Vec::new(),
             depth: None,
+            draw_order: Vec::new(),
+            draw_batches: Vec::new(),
             device,
             surface,
             instance,
@@ -323,7 +331,7 @@ impl Context {
     pub fn draw(
         &mut self,
         camera: &Camera,
-        material: MaterialId,
+        draws: &[scene::Draw],
         target: RenderTarget,
         prepare: impl FnOnce(vk::Queue) -> Result<(), Error>,
         overlay: impl FnOnce(Overlay<'_>) -> Result<(), Error>,
@@ -367,7 +375,30 @@ impl Context {
         self.shaders.flush_retired();
         self.bindless.flush();
         self.shaders.poll();
-        let material_index = self.bindless.material_index(material)?;
+        if draws_scene {
+            let mut order = std::mem::take(&mut self.draw_order);
+            let mut batches = std::mem::take(&mut self.draw_batches);
+            let planned = instances::plan_draws(
+                draws,
+                |material| {
+                    self.bindless
+                        .material_index(MaterialId {
+                            index: material.index,
+                            generation: material.generation,
+                        })
+                        .ok()
+                },
+                &mut order,
+                &mut batches,
+            );
+            self.draw_order = order;
+            self.draw_batches = batches;
+            planned?;
+            self.bindless.write_worlds(draws, &self.draw_order);
+        } else {
+            self.draw_order.clear();
+            self.draw_batches.clear();
+        }
 
         let acquire = unsafe {
             self.swapchain.loader.acquire_next_image(
@@ -409,13 +440,14 @@ impl Context {
             .as_ref()
             .map(|scene| scene.extent)
             .unwrap_or(swapchain_extent);
-        let frame = material::FramePush {
+        let mut frame = material::FramePush {
             view_proj: camera.view_proj(frame_extent).to_cols_array(),
-            material_index,
-            pad0: 0,
+            material_index: 0,
+            instance_base: 0,
             pad1: 0,
             pad2: 0,
         };
+        let batches = std::mem::take(&mut self.draw_batches);
         let descriptor_set = self.bindless.descriptor_set();
         let material_buffers = self.bindless.material_buffers();
         let image_available = self.sync.image_available;
@@ -423,7 +455,7 @@ impl Context {
         let queue = self.device.graphics.handle;
         let offscreen = scene.as_ref().is_some_and(|scene| scene.offscreen);
 
-        self.commands.record(|device, command_buffer| {
+        let recorded = self.commands.record(|device, command_buffer| {
             record_material_visibility(device, command_buffer, material_buffers);
             record_frame(
                 device,
@@ -436,10 +468,13 @@ impl Context {
                 depth,
                 drawn,
                 descriptor_set,
-                &frame,
+                &batches,
+                &mut frame,
                 overlay,
             )
-        })?;
+        });
+        self.draw_batches = batches;
+        recorded?;
         // The overlay rebinds the scene view before sampling it. The previous image can go now.
         self.retired_viewports.clear();
 
@@ -447,14 +482,10 @@ impl Context {
         self.commands
             .submit_frame(queue, image_available, signal, in_flight)?;
         self.swapchain.layouts[index] = vk::ImageLayout::PRESENT_SRC_KHR;
-        if offscreen
-            && let Some(viewport) = self.viewport.as_mut()
-        {
+        if offscreen && let Some(viewport) = self.viewport.as_mut() {
             viewport.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
-        if draws_scene
-            && let Some(depth) = self.depth.as_mut()
-        {
+        if draws_scene && let Some(depth) = self.depth.as_mut() {
             depth.layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
         }
 
@@ -632,7 +663,8 @@ fn record_frame(
     depth: Option<DepthPass>,
     drawn: Option<shader::DrawBinding>,
     descriptor_set: vk::DescriptorSet,
-    frame: &material::FramePush,
+    batches: &[instances::Batch],
+    frame: &mut material::FramePush,
     overlay: impl FnOnce(Overlay<'_>) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let color_range = color_range();
@@ -675,6 +707,7 @@ fn record_frame(
             depth.view,
             drawn,
             descriptor_set,
+            batches,
             frame,
         )?;
         if scene.offscreen {
@@ -753,7 +786,8 @@ fn record_scene(
     depth_view: vk::ImageView,
     drawn: shader::DrawBinding,
     descriptor_set: vk::DescriptorSet,
-    frame: &material::FramePush,
+    batches: &[instances::Batch],
+    frame: &mut material::FramePush,
 ) -> Result<(), Error> {
     if drawn.push_size as usize != std::mem::size_of::<material::FramePush>() {
         return Err(Error::ShaderInterface(format!(
@@ -765,7 +799,7 @@ fn record_scene(
     let frame_bytes = unsafe {
         std::slice::from_raw_parts(
             (frame as *const material::FramePush).cast::<u8>(),
-            drawn.push_size as usize,
+            std::mem::size_of::<material::FramePush>(),
         )
     };
     let attachment = vk::RenderingAttachmentInfo::default()
@@ -839,7 +873,20 @@ fn record_scene(
                 extent: scene.extent,
             }],
         );
-        device.cmd_draw(command_buffer, 36, 1, 0, 0);
+        for batch in batches {
+            frame.material_index = batch.material_index;
+            frame.instance_base = batch.begin;
+            let tail =
+                std::slice::from_raw_parts((&frame.material_index as *const u32).cast::<u8>(), 8);
+            device.cmd_push_constants(
+                command_buffer,
+                drawn.layout,
+                drawn.push_stages,
+                drawn.push_offset + 64,
+                tail,
+            );
+            device.cmd_draw(command_buffer, batch.vertices, batch.count, 0, 0);
+        }
         device.cmd_end_rendering(command_buffer);
     }
     Ok(())

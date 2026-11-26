@@ -13,7 +13,7 @@ pub struct App {
     input: input::Input,
     camera: render::Camera,
     scene: scene::Scene,
-    material: Option<render::MaterialId>,
+    extract: scene::Extract,
     last_frame: Option<std::time::Instant>,
     looking: bool,
 }
@@ -100,8 +100,8 @@ impl ApplicationHandler for App {
             }
         };
 
+        attach_child_mesh(&mut self.scene, material);
         window.request_redraw();
-        self.material = Some(material);
         self.editor = Some(editor);
         self.render = Some(render);
         self.window = Some(window);
@@ -131,9 +131,6 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let Some(material) = self.material else {
-                    return;
-                };
                 if self.window.is_none() {
                     return;
                 }
@@ -156,6 +153,7 @@ impl ApplicationHandler for App {
                     keyboard_captured,
                 );
                 self.scene.update();
+                self.scene.extract_into(&mut self.extract);
                 let extent = self
                     .window
                     .as_ref()
@@ -195,7 +193,7 @@ impl ApplicationHandler for App {
                     };
                     render.draw(
                         &self.camera,
-                        material,
+                        &self.extract.draws,
                         target,
                         |queue| {
                             editor
@@ -348,7 +346,7 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
         input: input::Input::default(),
         camera: render::Camera::new(),
         scene: demo_scene(),
-        material: None,
+        extract: scene::Extract::default(),
         last_frame: None,
         looking: false,
     })
@@ -357,14 +355,48 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
 fn demo_scene() -> scene::Scene {
     let mut scene = scene::Scene::new();
     let root = scene.spawn();
-    scene.set_name(root, "Root").expect("root");
+    scene.insert(root, scene::Name::new("Root")).expect("root");
     let child = scene.spawn_child(root).expect("root");
-    scene.set_name(child, "Child").expect("child");
+    scene
+        .insert(child, scene::Name::new("Child"))
+        .expect("child");
     scene
         .set_local_position(child, scene::Vec3::X)
         .expect("child");
     scene.update();
     scene
+}
+
+fn attach_child_mesh(scene: &mut scene::Scene, material: render::MaterialId) {
+    let material = scene::MaterialRef {
+        index: material.index,
+        generation: material.generation,
+    };
+    let roots: Vec<_> = scene.roots().collect();
+    let mut children = Vec::new();
+    for root in roots {
+        if let Ok(kids) = scene.children(root) {
+            children.extend(kids);
+        }
+    }
+    for child in children {
+        if scene
+            .get::<scene::Name>(child)
+            .ok()
+            .flatten()
+            .is_some_and(|name| name == "Child")
+        {
+            scene
+                .insert(
+                    child,
+                    scene::MeshRenderer {
+                        mesh: scene::Mesh::Cube,
+                        material,
+                    },
+                )
+                .expect("child mesh");
+        }
+    }
 }
 
 fn checker(size: u32) -> Vec<u8> {

@@ -1,5 +1,12 @@
 #include "bindless.slang"
 
+struct WorldMatrix {
+    column_major float4x4 value;
+};
+
+[[vk::binding(4, 0)]]
+StructuredBuffer<WorldMatrix> worlds;
+
 struct Varying {
     float4 position : SV_Position;
     [[vk::location(0)]] float3 local_pos;
@@ -27,10 +34,11 @@ static const uint indices[36] = {
 };
 
 [shader("vertex")]
-Varying vertexMain(uint vertexId : SV_VertexID) {
+Varying vertexMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID) {
     Varying output;
     float3 position = corners[indices[vertexId]];
-    output.position = mul(frame.view_proj, float4(position, 1.0));
+    float4x4 world = worlds[frame.instance_base + instanceId].value;
+    output.position = mul(frame.view_proj, mul(world, float4(position, 1.0)));
     output.local_pos = position;
     return output;
 }

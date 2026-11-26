@@ -13,6 +13,7 @@ const BINDLESS_TEXTURES: u32 = 0;
 const BINDLESS_SAMPLERS: u32 = 1;
 const BINDLESS_MATERIALS: u32 = 2;
 const BINDLESS_PARAMS: u32 = 3;
+const BINDLESS_WORLDS: u32 = 4;
 const SAMPLER_COUNT: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,7 +197,9 @@ fn canonical(binding: &Binding) -> Result<(), String> {
     let (ty, runtime_array, count) = match binding.binding {
         BINDLESS_TEXTURES => (vk::DescriptorType::SAMPLED_IMAGE, true, 0),
         BINDLESS_SAMPLERS => (vk::DescriptorType::SAMPLER, false, SAMPLER_COUNT),
-        BINDLESS_MATERIALS | BINDLESS_PARAMS => (vk::DescriptorType::STORAGE_BUFFER, false, 1),
+        BINDLESS_MATERIALS | BINDLESS_PARAMS | BINDLESS_WORLDS => {
+            (vk::DescriptorType::STORAGE_BUFFER, false, 1)
+        }
         other => {
             return Err(format!(
                 "descriptor set 0 binding {other} is not part of the bindless layout"
@@ -321,6 +324,8 @@ mod tests {
         assert_eq!(find_binding(set, 2).count, 1);
         assert_eq!(find_binding(set, 3).ty, vk::DescriptorType::STORAGE_BUFFER);
         assert_eq!(find_binding(set, 3).count, 1);
+        assert_eq!(find_binding(set, 4).ty, vk::DescriptorType::STORAGE_BUFFER);
+        assert_eq!(find_binding(set, 4).count, 1);
         assert!(
             interface
                 .push

@@ -2002,6 +2002,7 @@ dependencies = [
  "glam",
  "notify",
  "raw-window-handle",
+ "scene",
  "spirq",
 ]
 

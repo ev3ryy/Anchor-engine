@@ -13,6 +13,7 @@ pub struct App {
     input: input::Input,
     camera: render::Camera,
     scene: scene::Scene,
+    material: Option<scene::MaterialRef>,
     extract: scene::Extract,
     last_frame: Option<std::time::Instant>,
     looking: bool,
@@ -100,7 +101,12 @@ impl ApplicationHandler for App {
             }
         };
 
+        let material = scene::MaterialRef {
+            index: material.index,
+            generation: material.generation,
+        };
         attach_child_mesh(&mut self.scene, material);
+        self.material = Some(material);
         window.request_redraw();
         self.editor = Some(editor);
         self.render = Some(render);
@@ -152,8 +158,6 @@ impl ApplicationHandler for App {
                     self.looking,
                     keyboard_captured,
                 );
-                self.scene.update();
-                self.scene.extract_into(&mut self.extract);
                 let extent = self
                     .window
                     .as_ref()
@@ -164,21 +168,27 @@ impl ApplicationHandler for App {
                         editor,
                         camera,
                         scene,
+                        material,
                         window,
                         ..
                     } = self;
-                    if let (Some(editor), Some(window)) = (editor.as_mut(), window.as_ref()) {
+                    if let (Some(editor), Some(window), Some(material)) =
+                        (editor.as_mut(), window.as_ref(), material.as_ref())
+                    {
                         editor.begin_frame(
                             window,
                             editor::FrameView {
                                 camera,
                                 scene,
+                                default_material: *material,
                                 dt,
                                 extent: [extent.width, extent.height],
                             },
                         );
                     }
                 }
+                self.scene.update();
+                self.scene.extract_into(&mut self.extract);
                 let target = self
                     .editor
                     .as_ref()
@@ -346,6 +356,7 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
         input: input::Input::default(),
         camera: render::Camera::new(),
         scene: demo_scene(),
+        material: None,
         extract: scene::Extract::default(),
         last_frame: None,
         looking: false,
@@ -367,11 +378,7 @@ fn demo_scene() -> scene::Scene {
     scene
 }
 
-fn attach_child_mesh(scene: &mut scene::Scene, material: render::MaterialId) {
-    let material = scene::MaterialRef {
-        index: material.index,
-        generation: material.generation,
-    };
+fn attach_child_mesh(scene: &mut scene::Scene, material: scene::MaterialRef) {
     let roots: Vec<_> = scene.roots().collect();
     let mut children = Vec::new();
     for root in roots {

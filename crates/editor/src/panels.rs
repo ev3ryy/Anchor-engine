@@ -15,10 +15,19 @@ pub(crate) struct Panels<'a> {
     pub viewport: &'a mut Option<egui::Rect>,
     pub viewport_px: &'a mut [u32; 2],
     pub scene: Option<egui::TextureId>,
-    pub world: &'a scene::Scene,
+    pub world: &'a mut scene::Scene,
+    pub selection: &'a mut Option<scene::Entity>,
+    pub default_material: scene::MaterialRef,
     pub camera: &'a Camera,
     pub dt: f32,
     pub extent: [u32; 2],
+}
+
+#[derive(Clone, Copy)]
+enum HierarchyAction {
+    CreateRoot,
+    CreateChild(scene::Entity),
+    Delete(scene::Entity),
 }
 
 pub(crate) fn dock_state() -> DockState<Tab> {
@@ -50,13 +59,8 @@ impl TabViewer for Panels<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             Tab::Hierarchy => {
-                if self.world.is_empty() {
-                    ui.label("No scene");
-                } else {
-                    for root in self.world.roots() {
-                        hierarchy(ui, self.world, root, 0);
-                    }
-                }
+                let action = hierarchy_panel(ui, self.world, self.selection);
+                apply_hierarchy(self.world, self.selection, action);
             }
             Tab::Viewport => {
                 let rect = ui.max_rect();
@@ -72,7 +76,11 @@ impl TabViewer for Panels<'_> {
                 }
             }
             Tab::Inspector => {
+                inspector(ui, self.world, self.selection, self.default_material);
+            }
+            Tab::Stats => {
                 let position = self.camera.position();
+                ui.label(format!("frame     {:>7.2} ms", self.dt * 1000.0));
                 ui.label(format!(
                     "position  {:>7.2} {:>7.2} {:>7.2}",
                     position.x, position.y, position.z
@@ -86,9 +94,6 @@ impl TabViewer for Panels<'_> {
                     self.camera.pitch().to_degrees()
                 ));
                 ui.label(format!("speed     {:>7.2}", self.camera.speed()));
-            }
-            Tab::Stats => {
-                ui.label(format!("frame     {:>7.2} ms", self.dt * 1000.0));
                 ui.label(format!(
                     "viewport  {:>7} × {}",
                     self.viewport_px[0], self.viewport_px[1]
@@ -118,20 +123,473 @@ impl TabViewer for Panels<'_> {
     }
 }
 
-fn hierarchy(ui: &mut egui::Ui, world: &scene::Scene, entity: scene::Entity, depth: usize) {
+fn hierarchy_panel(
+    ui: &mut egui::Ui,
+    world: &scene::Scene,
+    selection: &mut Option<scene::Entity>,
+) -> Option<HierarchyAction> {
+    let mut action = None;
     ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 12.0);
-        let label = world
-            .get::<scene::Name>(entity)
-            .ok()
-            .flatten()
-            .map(scene::Name::as_str)
-            .unwrap_or("Entity");
-        ui.label(label);
+        if ui.button("Create").clicked() {
+            action = Some(HierarchyAction::CreateRoot);
+        }
+        let child = ui.add_enabled(selection.is_some(), egui::Button::new("Child"));
+        if child.clicked()
+            && let Some(parent) = *selection
+        {
+            action = Some(HierarchyAction::CreateChild(parent));
+        }
+        let delete = ui.add_enabled(selection.is_some(), egui::Button::new("Delete"));
+        if delete.clicked()
+            && let Some(entity) = *selection
+        {
+            action = Some(HierarchyAction::Delete(entity));
+        }
     });
-    if let Ok(children) = world.children(entity) {
-        for child in children {
-            hierarchy(ui, world, child, depth + 1);
+    if world.is_empty() {
+        ui.label("No scene");
+        return action;
+    }
+    let roots: Vec<_> = world.roots().collect();
+    for root in roots {
+        hierarchy_node(ui, world, selection, &mut action, root, 0);
+    }
+    action
+}
+
+fn hierarchy_node(
+    ui: &mut egui::Ui,
+    world: &scene::Scene,
+    selection: &mut Option<scene::Entity>,
+    action: &mut Option<HierarchyAction>,
+    entity: scene::Entity,
+    depth: usize,
+) {
+    ui.push_id(entity, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
+            let label = world
+                .get::<scene::Name>(entity)
+                .ok()
+                .flatten()
+                .map(scene::Name::as_str)
+                .unwrap_or("Entity");
+            let response = ui.selectable_label(*selection == Some(entity), label);
+            if response.clicked() {
+                *selection = Some(entity);
+            }
+            response.context_menu(|ui| {
+                if ui.button("Child").clicked() {
+                    *action = Some(HierarchyAction::CreateChild(entity));
+                    ui.close();
+                }
+                if ui.button("Delete").clicked() {
+                    *action = Some(HierarchyAction::Delete(entity));
+                    ui.close();
+                }
+            });
+        });
+    });
+    let children: Vec<_> = world
+        .children(entity)
+        .map(|kids| kids.collect())
+        .unwrap_or_default();
+    for child in children {
+        hierarchy_node(ui, world, selection, action, child, depth + 1);
+    }
+}
+
+fn apply_hierarchy(
+    world: &mut scene::Scene,
+    selection: &mut Option<scene::Entity>,
+    action: Option<HierarchyAction>,
+) {
+    let Some(action) = action else {
+        return;
+    };
+    match action {
+        HierarchyAction::CreateRoot => {
+            let entity = world.spawn();
+            let _ = world.insert(entity, scene::Name::new("Entity"));
+            *selection = Some(entity);
+        }
+        HierarchyAction::CreateChild(parent) => {
+            if let Ok(entity) = world.spawn_child(parent) {
+                let _ = world.insert(entity, scene::Name::new("Entity"));
+                *selection = Some(entity);
+            }
+        }
+        HierarchyAction::Delete(entity) => {
+            if let Ok(destroyed) = world.despawn(entity)
+                && selection.is_some_and(|selected| destroyed.contains(&selected))
+            {
+                *selection = None;
+            }
         }
     }
+}
+
+fn inspector(
+    ui: &mut egui::Ui,
+    world: &mut scene::Scene,
+    selection: &Option<scene::Entity>,
+    default_material: scene::MaterialRef,
+) {
+    let Some(entity) = *selection else {
+        ui.label("No selection");
+        return;
+    };
+    if world.local(entity).is_err() {
+        ui.label("No selection");
+        return;
+    }
+    ui.label("Transform");
+    edit_transform(ui, world, entity);
+    let ids: Vec<_> = world
+        .components(entity)
+        .map(|mask| mask.iter().collect())
+        .unwrap_or_default();
+    for id in ids {
+        ui.separator();
+        let mut removed = false;
+        ui.horizontal(|ui| {
+            ui.label(component_label(id));
+            removed = ui.button("Remove").clicked();
+        });
+        if removed {
+            remove_component(world, entity, id);
+            continue;
+        }
+        edit_component(ui, world, entity, id);
+    }
+    ui.separator();
+    let mask = world
+        .components(entity)
+        .unwrap_or(scene::ComponentMask::EMPTY);
+    let missing = [
+        scene::ComponentId::Name,
+        scene::ComponentId::Mesh,
+        scene::ComponentId::Camera,
+        scene::ComponentId::Light,
+    ]
+    .into_iter()
+    .filter(|id| !mask.contains(*id))
+    .collect::<Vec<_>>();
+    if missing.is_empty() {
+        ui.add_enabled(false, egui::Button::new("Add Component"));
+        return;
+    }
+    ui.menu_button("Add Component", |ui| {
+        for id in missing {
+            if ui.button(component_label(id)).clicked() {
+                add_component(world, entity, id, default_material);
+                ui.close();
+            }
+        }
+    });
+}
+
+fn edit_transform(ui: &mut egui::Ui, world: &mut scene::Scene, entity: scene::Entity) {
+    let Ok(local) = world.local(entity) else {
+        return;
+    };
+    let mut translation = local.translation;
+    if drag_vec3(ui, "Position", &mut translation) {
+        let _ = world.set_local_position(entity, translation);
+    }
+    let (yaw, pitch, roll) = local.rotation.to_euler(glam::EulerRot::YXZ);
+    let mut degrees = [yaw.to_degrees(), pitch.to_degrees(), roll.to_degrees()];
+    if drag_euler(ui, &mut degrees) {
+        let rotation = scene::Quat::from_euler(
+            glam::EulerRot::YXZ,
+            degrees[0].to_radians(),
+            degrees[1].to_radians(),
+            degrees[2].to_radians(),
+        );
+        let _ = world.set_local_rotation(entity, rotation);
+    }
+    let mut scale = local.scale;
+    if drag_vec3(ui, "Scale", &mut scale) {
+        let _ = world.set_local_scale(entity, scale);
+    }
+}
+
+fn edit_component(
+    ui: &mut egui::Ui,
+    world: &mut scene::Scene,
+    entity: scene::Entity,
+    id: scene::ComponentId,
+) {
+    match id {
+        scene::ComponentId::Name => {
+            let Some(name) = world
+                .get::<scene::Name>(entity)
+                .ok()
+                .flatten()
+                .map(scene::Name::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            let mut text = name;
+            if ui.text_edit_singleline(&mut text).changed() {
+                let _ = world.insert(entity, scene::Name::new(text));
+            }
+        }
+        scene::ComponentId::Mesh => {
+            let Some(mesh) = world
+                .get::<scene::MeshRenderer>(entity)
+                .ok()
+                .flatten()
+                .copied()
+            else {
+                return;
+            };
+            ui.label("Cube");
+            let mut index = mesh.material.index;
+            let mut generation = mesh.material.generation;
+            let index_changed = drag_u32(ui, "Material", &mut index);
+            let generation_changed = drag_u32(ui, "Generation", &mut generation);
+            if index_changed || generation_changed {
+                let _ = world.insert(
+                    entity,
+                    scene::MeshRenderer {
+                        mesh: scene::Mesh::Cube,
+                        material: scene::MaterialRef { index, generation },
+                    },
+                );
+            }
+        }
+        scene::ComponentId::Camera => edit_camera(ui, world, entity),
+        scene::ComponentId::Light => edit_light(ui, world, entity),
+    }
+}
+
+fn edit_camera(ui: &mut egui::Ui, world: &mut scene::Scene, entity: scene::Entity) {
+    let Some(camera) = world.get::<scene::Camera>(entity).ok().flatten().copied() else {
+        return;
+    };
+    let mut fov = camera.fov_y.to_degrees();
+    let mut near = camera.near;
+    let mut far = camera.far;
+    let clamped = fov < 1.0 || fov > 179.0 || near < 0.01 || far <= near;
+    fov = fov.clamp(1.0, 179.0);
+    near = near.max(0.01);
+    far = far.max(near + 1.0e-3);
+    let fov_changed = ui
+        .horizontal(|ui| {
+            ui.label("Fov");
+            ui.add(
+                egui::DragValue::new(&mut fov)
+                    .range(1.0..=179.0)
+                    .suffix("°"),
+            )
+            .changed()
+        })
+        .inner;
+    let near_changed = ui
+        .horizontal(|ui| {
+            ui.label("Near");
+            ui.add(
+                egui::DragValue::new(&mut near)
+                    .range(0.01..=1.0e6 - 1.0e-3)
+                    .speed(0.01),
+            )
+            .changed()
+        })
+        .inner;
+    near = near.max(0.01);
+    far = far.max(near + 1.0e-3);
+    let far_changed = ui
+        .horizontal(|ui| {
+            ui.label("Far");
+            ui.add(
+                egui::DragValue::new(&mut far)
+                    .speed(0.1)
+                    .range(near + 1.0e-3..=1.0e6),
+            )
+            .changed()
+        })
+        .inner;
+    far = far.max(near + 1.0e-3);
+    if clamped || fov_changed || near_changed || far_changed {
+        let _ = world.insert(
+            entity,
+            scene::Camera {
+                fov_y: fov.to_radians(),
+                near,
+                far,
+            },
+        );
+    }
+}
+
+fn edit_light(ui: &mut egui::Ui, world: &mut scene::Scene, entity: scene::Entity) {
+    let Some(scene::Light::Directional { color, intensity }) =
+        world.get::<scene::Light>(entity).ok().flatten().copied()
+    else {
+        return;
+    };
+    ui.label("Direction is local -Z");
+    let mut rgb = [color.x, color.y, color.z];
+    let stored_intensity = intensity;
+    let mut intensity = intensity.max(0.0);
+    let color_changed = ui.color_edit_button_rgb(&mut rgb).changed();
+    let intensity_changed = ui
+        .horizontal(|ui| {
+            ui.label("Intensity");
+            ui.add(
+                egui::DragValue::new(&mut intensity)
+                    .range(0.0..=1.0e6)
+                    .speed(0.05),
+            )
+            .changed()
+        })
+        .inner;
+    intensity = intensity.max(0.0);
+    if color_changed || intensity_changed || intensity != stored_intensity {
+        let _ = world.insert(
+            entity,
+            scene::Light::Directional {
+                color: scene::Vec3::new(rgb[0], rgb[1], rgb[2]),
+                intensity,
+            },
+        );
+    }
+}
+
+fn add_component(
+    world: &mut scene::Scene,
+    entity: scene::Entity,
+    id: scene::ComponentId,
+    default_material: scene::MaterialRef,
+) {
+    match id {
+        scene::ComponentId::Name => {
+            let _ = world.insert(entity, scene::Name::new("Entity"));
+        }
+        scene::ComponentId::Mesh => {
+            let _ = world.insert(
+                entity,
+                scene::MeshRenderer {
+                    mesh: scene::Mesh::Cube,
+                    material: default_material,
+                },
+            );
+        }
+        scene::ComponentId::Camera => {
+            let _ = world.insert(
+                entity,
+                scene::Camera {
+                    fov_y: 60.0_f32.to_radians(),
+                    near: 0.1,
+                    far: 100.0,
+                },
+            );
+        }
+        scene::ComponentId::Light => {
+            let _ = world.insert(
+                entity,
+                scene::Light::Directional {
+                    color: scene::Vec3::ONE,
+                    intensity: 1.0,
+                },
+            );
+        }
+    }
+}
+
+fn remove_component(world: &mut scene::Scene, entity: scene::Entity, id: scene::ComponentId) {
+    match id {
+        scene::ComponentId::Name => {
+            let _ = world.remove::<scene::Name>(entity);
+        }
+        scene::ComponentId::Mesh => {
+            let _ = world.remove::<scene::MeshRenderer>(entity);
+        }
+        scene::ComponentId::Camera => {
+            let _ = world.remove::<scene::Camera>(entity);
+        }
+        scene::ComponentId::Light => {
+            let _ = world.remove::<scene::Light>(entity);
+        }
+    }
+}
+
+fn component_label(id: scene::ComponentId) -> &'static str {
+    match id {
+        scene::ComponentId::Name => "Name",
+        scene::ComponentId::Mesh => "Mesh",
+        scene::ComponentId::Camera => "Camera",
+        scene::ComponentId::Light => "Light",
+    }
+}
+
+fn drag_vec3(ui: &mut egui::Ui, label: &str, value: &mut scene::Vec3) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let x = ui
+            .add(
+                egui::DragValue::new(&mut value.x)
+                    .speed(0.05)
+                    .fixed_decimals(2),
+            )
+            .changed();
+        let y = ui
+            .add(
+                egui::DragValue::new(&mut value.y)
+                    .speed(0.05)
+                    .fixed_decimals(2),
+            )
+            .changed();
+        let z = ui
+            .add(
+                egui::DragValue::new(&mut value.z)
+                    .speed(0.05)
+                    .fixed_decimals(2),
+            )
+            .changed();
+        x || y || z
+    })
+    .inner
+}
+
+fn drag_euler(ui: &mut egui::Ui, degrees: &mut [f32; 3]) -> bool {
+    ui.horizontal(|ui| {
+        ui.label("Rotation");
+        let yaw = ui
+            .add(
+                egui::DragValue::new(&mut degrees[0])
+                    .speed(1.0)
+                    .suffix("°")
+                    .fixed_decimals(1),
+            )
+            .changed();
+        let pitch = ui
+            .add(
+                egui::DragValue::new(&mut degrees[1])
+                    .speed(1.0)
+                    .suffix("°")
+                    .fixed_decimals(1),
+            )
+            .changed();
+        let roll = ui
+            .add(
+                egui::DragValue::new(&mut degrees[2])
+                    .speed(1.0)
+                    .suffix("°")
+                    .fixed_decimals(1),
+            )
+            .changed();
+        yaw || pitch || roll
+    })
+    .inner
+}
+
+fn drag_u32(ui: &mut egui::Ui, label: &str, value: &mut u32) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(value).speed(1.0)).changed()
+    })
+    .inner
 }

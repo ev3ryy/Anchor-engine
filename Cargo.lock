@@ -509,6 +509,7 @@ dependencies = [
  "egui-ash-renderer",
  "egui-winit",
  "egui_dock",
+ "glam",
  "render",
  "scene",
  "window",

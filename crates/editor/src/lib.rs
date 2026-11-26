@@ -10,7 +10,8 @@ type GpuRenderer = egui_ash_renderer::Renderer<egui_ash_renderer::allocator::Def
 
 pub struct FrameView<'a> {
     pub camera: &'a render::Camera,
-    pub scene: &'a scene::Scene,
+    pub scene: &'a mut scene::Scene,
+    pub default_material: scene::MaterialRef,
     pub dt: f32,
     pub extent: [u32; 2],
 }
@@ -43,6 +44,7 @@ pub struct Editor {
     pending_free: Vec<egui::TextureId>,
     free_ready: Vec<egui::TextureId>,
     viewport_rect: Option<egui::Rect>,
+    selection: Option<scene::Entity>,
     scene: Option<scene_texture::SceneTexture>,
     pixels_per_point: f32,
     color_format: vk::Format,
@@ -113,6 +115,7 @@ impl Editor {
             pending_free: Vec::new(),
             free_ready: Vec::new(),
             viewport_rect: None,
+            selection: None,
             scene: None,
             pixels_per_point: window.scale_factor() as f32,
             color_format,
@@ -136,6 +139,7 @@ impl Editor {
 
     pub fn begin_frame(&mut self, window: &Window, view: FrameView<'_>) {
         let mut dock = self.dock.take().unwrap_or_else(panels::dock_state);
+        let mut selection = self.selection.take();
         let mut viewport_rect = None;
         let mut viewport_px = self.viewport_pixels().unwrap_or([0, 0]);
         let scene = self.scene.as_ref().map(|scene| scene.id);
@@ -146,6 +150,8 @@ impl Editor {
                 viewport_px: &mut viewport_px,
                 scene,
                 world: view.scene,
+                selection: &mut selection,
+                default_material: view.default_material,
                 camera: view.camera,
                 dt: view.dt,
                 extent: view.extent,
@@ -157,6 +163,10 @@ impl Editor {
                 });
         });
         self.dock = Some(dock);
+        if selection.is_some_and(|entity| view.scene.local(entity).is_err()) {
+            selection = None;
+        }
+        self.selection = selection;
         self.viewport_rect = viewport_rect;
         self.pixels_per_point = output.pixels_per_point;
         self.repaint = output

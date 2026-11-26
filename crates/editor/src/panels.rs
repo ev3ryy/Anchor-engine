@@ -17,6 +17,7 @@ pub(crate) struct Panels<'a> {
     pub scene: Option<egui::TextureId>,
     pub world: &'a mut scene::Scene,
     pub selection: &'a mut Option<scene::Entity>,
+    pub gizmo: &'a mut crate::gizmo::ObjectGizmo,
     pub default_material: scene::AssetId,
     pub camera: &'a Camera,
     pub dt: f32,
@@ -74,6 +75,8 @@ impl TabViewer for Panels<'_> {
                         egui::Color32::WHITE,
                     );
                 }
+                self.gizmo
+                    .show(ui, rect, self.camera, self.world, self.selection);
             }
             Tab::Inspector => {
                 inspector(ui, self.world, self.selection, self.default_material);

@@ -8,7 +8,8 @@ egui = "0.36"
 egui-winit = "0.36"
 egui-ash-renderer = "0.13"
 egui_dock = "0.21"
-glam = "0.30"
+glam = { version = "0.30", features = ["mint"] }
+transform-gizmo-egui = "0.11"
 render = { path = "../render" }
 scene = { path = "../scene" }
 window = { path = "../window" }

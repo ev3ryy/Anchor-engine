@@ -62,13 +62,25 @@ impl Camera {
         self.speed = (self.speed * 1.1_f32.powf(lines)).clamp(MIN_SPEED, MAX_SPEED);
     }
 
+    pub fn view(&self) -> glam::Mat4 {
+        glam::Mat4::look_to_rh(self.position, self.look_direction(), glam::Vec3::Y)
+    }
+
+    /// Right-handed projection with Y up. The Vulkan scene pass flips Y itself.
+    pub fn projection(&self, aspect: f32) -> glam::Mat4 {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
+        glam::Mat4::perspective_rh(60_f32.to_radians(), aspect, 0.1, 100.0)
+    }
+
     pub fn view_proj(&self, extent: vk::Extent2D) -> glam::Mat4 {
-        let aspect = extent.width as f32 / extent.height as f32;
-        let mut proj = glam::Mat4::perspective_rh(60_f32.to_radians(), aspect, 0.1, 100.0);
+        let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        let mut proj = self.projection(aspect);
         proj.y_axis.y *= -1.0;
-        let forward = self.look_direction();
-        let view = glam::Mat4::look_to_rh(self.position, forward, glam::Vec3::Y);
-        proj * view
+        proj * self.view()
     }
 
     fn look_direction(&self) -> glam::Vec3 {

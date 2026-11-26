@@ -1,3 +1,4 @@
+mod gizmo;
 mod panels;
 mod scene_texture;
 
@@ -53,6 +54,7 @@ pub struct Editor {
     free_ready: Vec<egui::TextureId>,
     viewport_rect: Option<egui::Rect>,
     selection: Option<scene::Entity>,
+    gizmo: gizmo::ObjectGizmo,
     scene: Option<scene_texture::SceneTexture>,
     pixels_per_point: f32,
     color_format: vk::Format,
@@ -124,6 +126,7 @@ impl Editor {
             free_ready: Vec::new(),
             viewport_rect: None,
             selection: None,
+            gizmo: gizmo::ObjectGizmo::default(),
             scene: None,
             pixels_per_point: window.scale_factor() as f32,
             color_format,
@@ -148,6 +151,7 @@ impl Editor {
     pub fn begin_frame(&mut self, window: &Window, view: FrameView<'_>) -> Vec<FileAction> {
         let mut dock = self.dock.take().unwrap_or_else(panels::dock_state);
         let mut selection = self.selection.take();
+        let mut gizmo = std::mem::take(&mut self.gizmo);
         let mut viewport_rect = None;
         let mut viewport_px = self.viewport_pixels().unwrap_or([0, 0]);
         let mut actions = Vec::new();
@@ -178,6 +182,7 @@ impl Editor {
                 scene,
                 world: view.scene,
                 selection: &mut selection,
+                gizmo: &mut gizmo,
                 default_material: view.default_material,
                 camera: view.camera,
                 dt: view.dt,
@@ -194,6 +199,7 @@ impl Editor {
             selection = None;
         }
         self.selection = selection;
+        self.gizmo = gizmo;
         self.viewport_rect = viewport_rect;
         self.pixels_per_point = output.pixels_per_point;
         self.repaint = output

@@ -1,5 +1,5 @@
 mod panels;
-mod scene;
+mod scene_texture;
 
 use egui_dock::DockState;
 use panels::{Panels, Tab};
@@ -10,6 +10,7 @@ type GpuRenderer = egui_ash_renderer::Renderer<egui_ash_renderer::allocator::Def
 
 pub struct FrameView<'a> {
     pub camera: &'a render::Camera,
+    pub scene: &'a scene::Scene,
     pub dt: f32,
     pub extent: [u32; 2],
 }
@@ -42,7 +43,7 @@ pub struct Editor {
     pending_free: Vec<egui::TextureId>,
     free_ready: Vec<egui::TextureId>,
     viewport_rect: Option<egui::Rect>,
-    scene: Option<scene::SceneTexture>,
+    scene: Option<scene_texture::SceneTexture>,
     pixels_per_point: f32,
     color_format: vk::Format,
     repaint: bool,
@@ -144,6 +145,7 @@ impl Editor {
                 viewport: &mut viewport_rect,
                 viewport_px: &mut viewport_px,
                 scene,
+                world: view.scene,
                 camera: view.camera,
                 dt: view.dt,
                 extent: view.extent,
@@ -314,7 +316,7 @@ impl Editor {
             scene.sync(&self.device, view);
             return Ok(());
         }
-        self.scene = Some(scene::SceneTexture::create(
+        self.scene = Some(scene_texture::SceneTexture::create(
             &self.device,
             &mut self.renderer,
             view,

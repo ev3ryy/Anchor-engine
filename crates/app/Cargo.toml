@@ -7,4 +7,5 @@ edition = "2024"
 editor = { path = "../editor" }
 input = { path = "../input" }
 render = { path = "../render" }
+scene = { path = "../scene" }
 window = { path = "../window" }

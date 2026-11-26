@@ -12,6 +12,7 @@ pub struct App {
     window: Option<Window>,
     input: input::Input,
     camera: render::Camera,
+    scene: scene::Scene,
     material: Option<render::MaterialId>,
     last_frame: Option<std::time::Instant>,
     looking: bool,
@@ -154,6 +155,7 @@ impl ApplicationHandler for App {
                     self.looking,
                     keyboard_captured,
                 );
+                self.scene.update();
                 let extent = self
                     .window
                     .as_ref()
@@ -163,6 +165,7 @@ impl ApplicationHandler for App {
                     let App {
                         editor,
                         camera,
+                        scene,
                         window,
                         ..
                     } = self;
@@ -171,6 +174,7 @@ impl ApplicationHandler for App {
                             window,
                             editor::FrameView {
                                 camera,
+                                scene,
                                 dt,
                                 extent: [extent.width, extent.height],
                             },
@@ -343,10 +347,24 @@ pub fn run() -> Result<(), window::winit::error::EventLoopError> {
         window: None,
         input: input::Input::default(),
         camera: render::Camera::new(),
+        scene: demo_scene(),
         material: None,
         last_frame: None,
         looking: false,
     })
+}
+
+fn demo_scene() -> scene::Scene {
+    let mut scene = scene::Scene::new();
+    let root = scene.spawn();
+    scene.set_name(root, "Root").expect("root");
+    let child = scene.spawn_child(root).expect("root");
+    scene.set_name(child, "Child").expect("child");
+    scene
+        .set_local_position(child, scene::Vec3::X)
+        .expect("child");
+    scene.update();
+    scene
 }
 
 fn checker(size: u32) -> Vec<u8> {

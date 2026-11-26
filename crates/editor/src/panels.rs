@@ -15,6 +15,7 @@ pub(crate) struct Panels<'a> {
     pub viewport: &'a mut Option<egui::Rect>,
     pub viewport_px: &'a mut [u32; 2],
     pub scene: Option<egui::TextureId>,
+    pub world: &'a scene::Scene,
     pub camera: &'a Camera,
     pub dt: f32,
     pub extent: [u32; 2],
@@ -49,7 +50,13 @@ impl TabViewer for Panels<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             Tab::Hierarchy => {
-                ui.label("No scene");
+                if self.world.is_empty() {
+                    ui.label("No scene");
+                } else {
+                    for root in self.world.roots() {
+                        hierarchy(ui, self.world, root, 0);
+                    }
+                }
             }
             Tab::Viewport => {
                 let rect = ui.max_rect();
@@ -107,6 +114,19 @@ impl TabViewer for Panels<'_> {
             [false, false]
         } else {
             [true, true]
+        }
+    }
+}
+
+fn hierarchy(ui: &mut egui::Ui, world: &scene::Scene, entity: scene::Entity, depth: usize) {
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        let label = world.name(entity).ok().flatten().unwrap_or("Entity");
+        ui.label(label);
+    });
+    if let Ok(children) = world.children(entity) {
+        for child in children {
+            hierarchy(ui, world, child, depth + 1);
         }
     }
 }
